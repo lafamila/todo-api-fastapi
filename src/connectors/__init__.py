@@ -1,42 +1,100 @@
 import pymysql
 import os
 from dotenv import load_dotenv
+from contextlib import contextmanager
 
 load_dotenv()
 
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT", "3306")
-DB_SCHEME = os.getenv("DB_SCHEME")
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST", "localhost"),
+    "port": int(os.getenv("DB_PORT", 3306)),
+    "user": os.getenv("DB_USER", "root"),
+    "password": os.getenv("DB_PASSWORD", ""),
+    "database": os.getenv("DB_NAME", "todo"),
+    "charset": "utf8mb4",
+    "cursorclass": pymysql.cursors.DictCursor,
+}
 
 
-class Connector:
-    def __init__(self):
-        self.conn = None
-        self.curs = None
+@contextmanager
+def get_db_connection():
+    connection = pymysql.connect(**DB_CONFIG)
+    try:
+        yield connection
+        connection.commit()
+    except Exception as e:
+        connection.rollback()
+        raise e
+    finally:
+        connection.close()
 
-    def __enter__(self):
-        self.conn = pymysql.connect(
-            host=DB_HOST,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            db=DB_SCHEME,
-            port=int(DB_PORT),
-        )
-        self.curs = self.conn.cursor(pymysql.cursors.DictCursor)
-        return self  # with 블록의 as 변수에 들어감
 
-    def cursor(self):
-        return self.curs
+def init_db():
+    """데이터베이스 초기화 - 테이블 생성"""
+    connection = pymysql.connect(
+        host=DB_CONFIG["host"],
+        port=DB_CONFIG["port"],
+        user=DB_CONFIG["user"],
+        password=DB_CONFIG["password"],
+        charset="utf8mb4",
+    )
 
-    def __exit__(self, exc_type, exc_value, traceback):
+    try:
+        with connection.cursor() as cursor:
+            # 데이터베이스 생성
+            cursor.execute(
+                f"CREATE DATABASE IF NOT EXISTS {DB_CONFIG['database']} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+            )
+            cursor.execute(f"USE {DB_CONFIG['database']}")
 
-        if self.curs:
-            self.curs.close()
-        if exc_type:
-            print(f"Exception occurred: {exc_type}, {exc_value}")
-        else:
-            self.conn.commit()
-        self.conn.close()
-        return False
+            # projects 테이블 생성
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS projects (
+                    id VARCHAR(50) PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    icon VARCHAR(10) NOT NULL,
+                    is_secret BOOLEAN DEFAULT FALSE,
+                    password VARCHAR(255),
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+            )
+
+            # memos 테이블 생성
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memos (
+                    id VARCHAR(50) PRIMARY KEY,
+                    project_id VARCHAR(50) NOT NULL,
+                    title VARCHAR(255) NOT NULL,
+                    content LONGTEXT,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                    INDEX idx_project_id (project_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+            )
+
+            # memo_versions 테이블 생성 (버전 히스토리)
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memo_versions (
+                    id VARCHAR(50) PRIMARY KEY,
+                    memo_id VARCHAR(50) NOT NULL,
+                    content LONGTEXT,
+                    version INT NOT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (memo_id) REFERENCES memos(id) ON DELETE CASCADE,
+                    INDEX idx_memo_id (memo_id),
+                    INDEX idx_memo_version (memo_id, version)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+            )
+
+            connection.commit()
+            print("Database initialized successfully")
+    finally:
+        connection.close()
