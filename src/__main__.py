@@ -206,7 +206,7 @@ async def login(data: LoginRequest):
             if not user["is_active"]:
                 raise HTTPException(status_code=401, detail="Account is inactive")
 
-            token = create_access_token({"sub": user["id"]})
+            token = create_access_token({"sub": user["id"], "display_name": user["display_name"], "username": user["username"]})
             return {
                 "accessToken": token,
                 "tokenType": "bearer",
@@ -249,7 +249,7 @@ async def register(data: RegisterRequest):
                 (user_id, data.username, hashed, data.displayName),
             )
 
-            token = create_access_token({"sub": user_id})
+            token = create_access_token({"sub": user_id, "display_name": data.displayName, "username": data.username})
             return {
                 "accessToken": token,
                 "tokenType": "bearer",
