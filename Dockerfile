@@ -14,9 +14,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-# deps
+# deps - install CPU-only PyTorch first to avoid huge CUDA download
 COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN pip install --upgrade pip \
+    && pip install torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip install -r requirements.txt
 
 # app source ('.env'는 이미지에 복사하지 않음)
 COPY src/ ./src/
