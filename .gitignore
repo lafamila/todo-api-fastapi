@@ -169,6 +169,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
-.idea
+
+# workspace convention: .idea/ holds plan documents and is intentionally tracked
 .DS_Store
 .omc/
