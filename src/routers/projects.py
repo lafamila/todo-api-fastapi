@@ -10,7 +10,7 @@ try:
         InviteMemberRequest,
         VerifyPasswordRequest,
     )
-    from ..utils import generate_id
+    from ..utils import can_manage_project, generate_id
 except ImportError:  # pragma: no cover
     from auth_utils import get_current_user, require_admin
     from connectors import get_db_connection
@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover
         InviteMemberRequest,
         VerifyPasswordRequest,
     )
-    from utils import generate_id
+    from utils import can_manage_project, generate_id
 
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -38,17 +38,10 @@ async def invite_member(
             project = cursor.fetchone()
             if not project:
                 raise HTTPException(status_code=404, detail="Project not found")
-            if project["owner_id"] != user["id"]:
+            if not can_manage_project(cursor, project_id, user):
                 raise HTTPException(
                     status_code=403, detail="Only project owner can invite members"
                 )
-
-            cursor.execute(
-                "SELECT id FROM users WHERE id = %s AND is_active = TRUE",
-                (data.userId,),
-            )
-            if not cursor.fetchone():
-                raise HTTPException(status_code=404, detail="User not found")
 
             cursor.execute(
                 "SELECT id FROM project_members WHERE project_id = %s AND user_id = %s",
@@ -60,8 +53,21 @@ async def invite_member(
             member_id = generate_id()
             now = datetime.now()
             cursor.execute(
-                "INSERT INTO project_members (id, project_id, user_id, role, invited_at) VALUES (%s, %s, %s, %s, %s)",
-                (member_id, project_id, data.userId, data.role, now),
+                """
+                INSERT INTO project_members
+                    (id, project_id, user_id, username, display_name, email, role, invited_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    member_id,
+                    project_id,
+                    data.userId,
+                    data.username,
+                    data.displayName,
+                    data.email,
+                    data.role,
+                    now,
+                ),
             )
             return {
                 "id": member_id,
@@ -69,6 +75,9 @@ async def invite_member(
                 "userId": data.userId,
                 "role": data.role,
                 "invitedAt": now.isoformat(),
+                "username": data.username or data.email or data.userId,
+                "displayName": data.displayName or data.username or data.userId,
+                "isAdmin": data.role == "owner",
             }
 
 
@@ -85,10 +94,18 @@ async def remove_member(
             project = cursor.fetchone()
             if not project:
                 raise HTTPException(status_code=404, detail="Project not found")
-            if project["owner_id"] != user["id"]:
+            if not can_manage_project(cursor, project_id, user):
                 raise HTTPException(
                     status_code=403, detail="Only project owner can remove members"
                 )
+
+            cursor.execute(
+                "SELECT role FROM project_members WHERE project_id = %s AND user_id = %s",
+                (project_id, member_user_id),
+            )
+            member = cursor.fetchone()
+            if member and member["role"] == "owner":
+                raise HTTPException(status_code=400, detail="Project owner cannot be removed")
 
             cursor.execute(
                 "DELETE FROM project_members WHERE project_id = %s AND user_id = %s",
@@ -120,10 +137,9 @@ async def get_project_members(
 
             cursor.execute(
                 """
-                SELECT pm.id, pm.project_id, pm.user_id, pm.role, pm.invited_at,
-                       u.username, u.display_name, u.is_admin
+                SELECT pm.id, pm.project_id, pm.user_id, pm.username,
+                       pm.display_name, pm.email, pm.role, pm.invited_at
                 FROM project_members pm
-                JOIN users u ON pm.user_id = u.id
                 WHERE pm.project_id = %s
                 ORDER BY pm.invited_at
             """,
@@ -137,9 +153,9 @@ async def get_project_members(
                     "userId": m["user_id"],
                     "role": m["role"],
                     "invitedAt": m["invited_at"].isoformat(),
-                    "username": m["username"],
-                    "displayName": m["display_name"],
-                    "isAdmin": bool(m["is_admin"]),
+                    "username": m["username"] or m["email"] or m["user_id"],
+                    "displayName": m["display_name"] or m["username"] or m["user_id"],
+                    "isAdmin": m["role"] == "owner",
                 }
                 for m in members
             ]
@@ -150,7 +166,15 @@ async def get_projects(user: dict = Depends(get_current_user)):
     """프로젝트 목록 조회"""
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            if user["is_admin"]:
+            if user.get("permission") == "owner":
+                cursor.execute(
+                    """
+                    SELECT DISTINCT p.id, p.name, p.icon, p.is_secret, p.owner_id, p.created_at, p.updated_at
+                    FROM projects p
+                    ORDER BY p.created_at DESC
+                """
+                )
+            elif user["is_admin"]:
                 cursor.execute(
                     """
                     SELECT DISTINCT p.id, p.name, p.icon, p.is_secret, p.owner_id, p.created_at, p.updated_at
@@ -218,10 +242,20 @@ async def create_project(
             )
             cursor.execute(
                 """
-                INSERT INTO project_members (id, project_id, user_id, role, invited_at)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO project_members
+                    (id, project_id, user_id, username, display_name, email, role, invited_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
-                (member_id, project_id, user["id"], "owner", now),
+                (
+                    member_id,
+                    project_id,
+                    user["id"],
+                    user.get("username"),
+                    user.get("display_name"),
+                    user.get("email"),
+                    "owner",
+                    now,
+                ),
             )
 
     return {

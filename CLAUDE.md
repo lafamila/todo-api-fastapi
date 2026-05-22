@@ -8,10 +8,12 @@ FastAPI backend owning all data. Raw SQL via PyMySQL against MySQL. Single-file 
 
 이 레포는 `../CLAUDE.md` 의 **DEVELOPMENT PRINCIPLES** 섹션을 따른다. 핵심 재진술:
 
-1. **인증** — 현재 LEGACY_LOCAL_AUTH — 프로젝트 단위 password 평문 저장. `auth-api-nest/.idea/oauth-blueprint.md` Phase 3 에서 `auth-api-nest` 의 access token 검증으로 교체 예정.
+1. **인증** — `auth-api-nest` access token 을 검증하는 resource server 로 전환 중. 로컬 `users`/password/JWT 는 제거 대상이다.
 2. **기능 단위 커밋** — 한 기능이 계획-구현-검토를 통과하면 즉시 1개의 커밋. 여러 기능을 묶지 않는다.
 3. **계획 → 구현 → 검토** — 계획 단계에서 검토 통과 기준(어떤 테스트/명령이 통과해야 "done"인지)을 명시한다.
 4. **Docker 빌드 가능** — DEPLOY. 루트 `docker-compose.yml` 의 `fastapi` 서비스로 등록됨 (포트 8000). Dockerfile 유지 필수.
+5. **Cross-repo 영향 보고** — 이 레포의 변경이 다른 repo, 공통 API 계약, auth claim/permission, env var, Docker/deploy 설정, 공통 문서에 영향을 준다고 판단되면 현재 orchestrator 에게 반드시 보고한다. 직접 보고할 수 없으면 워크스페이스 루트 `../.idea/` 에 `{REPO_NAME}_CROSS_REPO_IMPACT_{YYYYMMDD}.md` 형식의 handoff 문서를 남긴다.
+6. **사용자 결정 필요사항 에스컬레이션** — 사용자가 결정해야 하는 주요 사안은 임의로 판단하지 않고 작업을 중단한 뒤 현재 orchestrator 에게 전달하여 결정받고 진행한다. orchestrator 에 보고할 수 없으면 workspace root `../.idea/` 에 handoff 문서를 남긴다.
 
 ## Feature Workflow (대원칙 #3 의 이 레포 적용)
 
@@ -54,6 +56,35 @@ memo_versions (id PK, memo_id FK→memos, content LONGTEXT, version INT, created
 - Cascading deletes: project → memos → memo_versions
 - InnoDB, utf8mb4
 
+## TODO AUTHZ CONTRACT
+
+서비스 권한(`auth-api-nest` service permission claim)과 프로젝트 역할(`project_members.role`)은 별도 축이다.
+
+### Service Permission
+
+| Permission | Meaning | Main capabilities |
+|------------|---------|-------------------|
+| `owner` | 슈퍼관리자. Teddy 개인 계정. | 전체 todo 서비스 관리, 모든 프로젝트/게시글 관리, Daily Task Tracker 관리 |
+| `admin` | todo 서비스 관리자. | 자기 프로젝트 생성, 자기 프로젝트 멤버 검색/초대, `editor`/`viewer` 지정, 자기 slug 게시판에 publish/delete |
+| `user` | todo 서비스 접근 가능 일반 사용자. | 초대받은 프로젝트에서 프로젝트 역할에 따라 활동 |
+| `visitor` | todo 서비스 접근 신청 필요. | protected todo API 접근 불가 |
+
+`is_admin` 호환 필드는 `owner`/`admin` 에만 true 로 매핑한다. `is_super_admin` 호환 필드는 `owner` 에만 true 로 매핑한다.
+
+### Project Role
+
+| Role | Scope | Capabilities |
+|------|-------|--------------|
+| `owner` | 특정 프로젝트 | 멤버 관리, 메모 생성/수정/삭제, publish/delete |
+| `editor` | 특정 프로젝트 | 메모 생성/수정 |
+| `viewer` | 특정 프로젝트 | 읽기 전용 |
+
+프로젝트 생성자는 자동으로 project `owner` 가 된다. 초대 가능한 역할은 `editor` 또는 `viewer` 이다.
+
+### Article Board
+
+게시글은 service `admin`/`owner` 가 자신의 프로젝트 메모를 자신의 `authorSlug` 게시판으로 발행한다. `authorSlug` 는 auth token 의 `preferred_username`/email/sub 기반으로 생성하며, 공개 목록은 전체 또는 slug 별로 조회할 수 있다.
+
 ## CONVENTIONS
 
 - **Single file API** — all routes in `__main__.py` (no router splitting)
@@ -66,7 +97,7 @@ memo_versions (id PK, memo_id FK→memos, content LONGTEXT, version INT, created
 
 ## ANTI-PATTERNS
 
-- **Passwords stored in plaintext** — `project["password"] == data.password` (no hashing). 대원칙 #1 에서 auth-api-nest 통합 시 제거 예정.
+- **Project password is legacy** — 중앙 auth 전환 후 제거 대상.
 - **`@app.on_event("startup")`** is deprecated — should migrate to `lifespan` context manager
 - **No input sanitization** on f-string in `init_db()`: `f"CREATE DATABASE IF NOT EXISTS {DB_CONFIG['database']}"` (SQL injection risk if DB_NAME is user-controlled)
 - **Memo versioning** saves old content before update but **no version diffing** — stores full content copies

@@ -6,23 +6,19 @@ from fastapi.middleware.cors import CORSMiddleware
 try:
     from .connectors import init_db
     from .routers.articles import router as articles_router
-    from .routers.auth import router as auth_router
     from .routers.memos import router as memos_router
     from .routers.projects import router as projects_router
     from .routers.topics import router as topics_router
     from .routers.topics import sources_router as topic_sources_router
     from .routers.daily_tasks import router as daily_tasks_router
-    from .routers.users import router as users_router
 except ImportError:  # pragma: no cover
     from connectors import init_db
     from routers.articles import router as articles_router
-    from routers.auth import router as auth_router
     from routers.memos import router as memos_router
     from routers.projects import router as projects_router
     from routers.topics import router as topics_router
     from routers.topics import sources_router as topic_sources_router
     from routers.daily_tasks import router as daily_tasks_router
-    from routers.users import router as users_router
 
 
 @asynccontextmanager
@@ -43,8 +39,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(auth_router)
-app.include_router(users_router)
 app.include_router(projects_router)
 app.include_router(memos_router)
 app.include_router(articles_router)

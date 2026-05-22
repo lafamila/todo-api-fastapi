@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel
 
@@ -35,7 +35,10 @@ class LoginRequest(BaseModel):
 
 class InviteMemberRequest(BaseModel):
     userId: str
-    role: str = "member"
+    role: Literal["editor", "viewer"] = "viewer"
+    username: Optional[str] = None
+    displayName: Optional[str] = None
+    email: Optional[str] = None
 
 
 class RegisterRequest(BaseModel):
@@ -61,6 +64,8 @@ class Article(BaseModel):
     id: str
     memoId: str
     projectId: str
+    authorId: str
+    authorSlug: str
     title: str
     content: str
     publishedVersion: int

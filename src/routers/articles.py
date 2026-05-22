@@ -7,12 +7,12 @@ try:
     from ..auth_utils import get_current_user, require_admin
     from ..connectors import get_db_connection
     from ..models.base import PublishArticleRequest
-    from ..utils import check_project_membership, generate_id
+    from ..utils import can_manage_project, check_project_membership, generate_id, is_service_owner
 except ImportError:  # pragma: no cover
     from auth_utils import get_current_user, require_admin
     from connectors import get_db_connection
     from models.base import PublishArticleRequest
-    from utils import check_project_membership, generate_id
+    from utils import can_manage_project, check_project_membership, generate_id, is_service_owner
 
 
 router = APIRouter(prefix="/api", tags=["articles"])
@@ -42,7 +42,7 @@ async def publish_article(
             if not memo:
                 raise HTTPException(status_code=404, detail="Memo not found")
 
-            if memo["owner_id"] != user["id"]:
+            if not can_manage_project(cursor, memo["project_id"], user):
                 raise HTTPException(
                     status_code=403, detail="Only project owner can publish article"
                 )
@@ -54,12 +54,14 @@ async def publish_article(
             existing = cursor.fetchone()
 
             now = datetime.now()
+            author_slug = user["slug"]
 
             if existing:
                 cursor.execute(
                     """
                     UPDATE articles
                     SET title = %s, content = %s, published_version = %s,
+                        author_id = %s, author_slug = %s,
                         published_at = %s, updated_at = %s
                     WHERE memo_id = %s
                 """,
@@ -67,6 +69,8 @@ async def publish_article(
                         memo["title"],
                         memo["content"],
                         memo["current_version"],
+                        user["id"],
+                        author_slug,
                         now,
                         now,
                         data.memoId,
@@ -77,13 +81,17 @@ async def publish_article(
                 article_id = generate_id()
                 cursor.execute(
                     """
-                    INSERT INTO articles (id, memo_id, project_id, title, content, published_version, created_at, published_at, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO articles
+                        (id, memo_id, project_id, author_id, author_slug, title, content,
+                         published_version, created_at, published_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                     (
                         article_id,
                         data.memoId,
                         memo["project_id"],
+                        user["id"],
+                        author_slug,
                         memo["title"],
                         memo["content"],
                         memo["current_version"],
@@ -95,7 +103,8 @@ async def publish_article(
 
             cursor.execute(
                 """
-                SELECT a.id, a.memo_id, a.project_id, a.title, a.content,
+                SELECT a.id, a.memo_id, a.project_id, a.author_id, a.author_slug,
+                       a.title, a.content,
                        a.published_version, a.created_at, a.published_at, a.updated_at,
                        p.name as project_name, p.icon as project_icon, p.is_secret
                 FROM articles a
@@ -110,6 +119,8 @@ async def publish_article(
                 "id": article["id"],
                 "memoId": article["memo_id"],
                 "projectId": article["project_id"],
+                "authorId": article["author_id"],
+                "authorSlug": article["author_slug"],
                 "title": article["title"],
                 "content": article["content"],
                 "publishedVersion": article["published_version"],
@@ -123,34 +134,31 @@ async def publish_article(
 
 
 @router.get("/articles")
-async def get_articles(projectId: Optional[str] = None):
-    """게시글 목록 조회 (프로젝트별 필터 가능)"""
+async def get_articles(projectId: Optional[str] = None, authorSlug: Optional[str] = None):
+    """게시글 목록 조회 (프로젝트/게시자 slug별 필터 가능)"""
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
+            where = []
+            params = []
             if projectId:
-                cursor.execute(
-                    """
-                    SELECT a.id, a.memo_id, a.project_id, a.title,
-                           a.published_version, a.created_at, a.published_at, a.updated_at,
-                           p.name as project_name, p.icon as project_icon, p.is_secret
-                    FROM articles a
-                    JOIN projects p ON a.project_id = p.id
-                    WHERE a.project_id = %s
-                    ORDER BY a.published_at DESC
-                """,
-                    (projectId,),
-                )
-            else:
-                cursor.execute(
-                    """
-                    SELECT a.id, a.memo_id, a.project_id, a.title,
-                           a.published_version, a.created_at, a.published_at, a.updated_at,
-                           p.name as project_name, p.icon as project_icon, p.is_secret
-                    FROM articles a
-                    JOIN projects p ON a.project_id = p.id
-                    ORDER BY a.published_at DESC
-                """
-                )
+                where.append("a.project_id = %s")
+                params.append(projectId)
+            if authorSlug:
+                where.append("a.author_slug = %s")
+                params.append(authorSlug)
+            where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+            cursor.execute(
+                f"""
+                SELECT a.id, a.memo_id, a.project_id, a.author_id, a.author_slug, a.title,
+                       a.published_version, a.created_at, a.published_at, a.updated_at,
+                       p.name as project_name, p.icon as project_icon, p.is_secret
+                FROM articles a
+                JOIN projects p ON a.project_id = p.id
+                {where_sql}
+                ORDER BY a.published_at DESC
+            """,
+                tuple(params),
+            )
             articles = cursor.fetchall()
 
             return [
@@ -158,6 +166,8 @@ async def get_articles(projectId: Optional[str] = None):
                     "id": a["id"],
                     "memoId": a["memo_id"],
                     "projectId": a["project_id"],
+                    "authorId": a["author_id"],
+                    "authorSlug": a["author_slug"],
                     "title": a["title"],
                     "publishedVersion": a["published_version"],
                     "createdAt": a["created_at"].isoformat(),
@@ -171,6 +181,12 @@ async def get_articles(projectId: Optional[str] = None):
             ]
 
 
+@router.get("/articles/boards/{author_slug}")
+async def get_author_articles(author_slug: str):
+    """특정 admin slug 게시판의 게시글 목록 조회"""
+    return await get_articles(authorSlug=author_slug)
+
+
 @router.get("/articles/{article_id}")
 async def get_article(article_id: str):
     """게시글 상세 조회 (비밀 프로젝트 콘텐츠 제외)"""
@@ -178,7 +194,8 @@ async def get_article(article_id: str):
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT a.id, a.memo_id, a.project_id, a.title, a.content,
+                SELECT a.id, a.memo_id, a.project_id, a.author_id, a.author_slug,
+                       a.title, a.content,
                        a.published_version, a.created_at, a.published_at, a.updated_at,
                        p.name as project_name, p.icon as project_icon, p.is_secret
                 FROM articles a
@@ -196,6 +213,8 @@ async def get_article(article_id: str):
                 "id": article["id"],
                 "memoId": article["memo_id"],
                 "projectId": article["project_id"],
+                "authorId": article["author_id"],
+                "authorSlug": article["author_slug"],
                 "title": article["title"],
                 "content": article["content"],
                 "publishedVersion": article["published_version"],
@@ -215,7 +234,7 @@ async def delete_article(article_id: str, user: dict = Depends(require_admin)):
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT a.id, p.owner_id
+                SELECT a.id, a.project_id, a.author_id, p.owner_id
                 FROM articles a
                 JOIN projects p ON a.project_id = p.id
                 WHERE a.id = %s
@@ -226,7 +245,7 @@ async def delete_article(article_id: str, user: dict = Depends(require_admin)):
             if not article:
                 raise HTTPException(status_code=404, detail="Article not found")
 
-            if article["owner_id"] != user["id"]:
+            if article["author_id"] != user["id"] and not is_service_owner(user):
                 raise HTTPException(
                     status_code=403, detail="Only project owner can delete article"
                 )
@@ -253,7 +272,8 @@ async def get_memo_article(memo_id: str, user: dict = Depends(get_current_user))
 
             cursor.execute(
                 """
-                SELECT a.id, a.memo_id, a.project_id, a.title, a.content,
+                SELECT a.id, a.memo_id, a.project_id, a.author_id, a.author_slug,
+                       a.title, a.content,
                        a.published_version, a.created_at, a.published_at, a.updated_at
                 FROM articles a
                 WHERE a.memo_id = %s
@@ -269,6 +289,8 @@ async def get_memo_article(memo_id: str, user: dict = Depends(get_current_user))
                 "id": article["id"],
                 "memoId": article["memo_id"],
                 "projectId": article["project_id"],
+                "authorId": article["author_id"],
+                "authorSlug": article["author_slug"],
                 "title": article["title"],
                 "content": article["content"],
                 "publishedVersion": article["published_version"],

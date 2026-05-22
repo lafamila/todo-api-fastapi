@@ -173,3 +173,4 @@ cython_debug/
 # workspace convention: .idea/ holds plan documents and is intentionally tracked
 .DS_Store
 .omc/
+.omx/

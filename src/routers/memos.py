@@ -10,7 +10,7 @@ try:
         CreateMemoRequest,
         UpdateMemoRequest,
     )
-    from ..utils import check_project_membership, generate_id
+    from ..utils import can_manage_project, can_write_project, check_project_membership, generate_id
 except ImportError:  # pragma: no cover
     from auth_utils import get_current_user, require_admin
     from connectors import get_db_connection
@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover
         CreateMemoRequest,
         UpdateMemoRequest,
     )
-    from utils import check_project_membership, generate_id
+    from utils import can_manage_project, can_write_project, check_project_membership, generate_id
 
 
 router = APIRouter(prefix="/api", tags=["memos"])
@@ -74,7 +74,7 @@ async def create_memo(data: CreateMemoRequest, user: dict = Depends(get_current_
             if not cursor.fetchone():
                 raise HTTPException(status_code=404, detail="Project not found")
 
-            if not check_project_membership(cursor, data.projectId, user):
+            if not can_write_project(cursor, data.projectId, user):
                 raise HTTPException(status_code=403, detail="Access denied")
 
             cursor.execute(
@@ -157,7 +157,7 @@ async def update_memo(
             if not memo:
                 raise HTTPException(status_code=404, detail="Memo not found")
 
-            if not check_project_membership(cursor, memo["project_id"], user):
+            if not can_write_project(cursor, memo["project_id"], user):
                 raise HTTPException(status_code=403, detail="Access denied")
 
             if memo["content"]:
@@ -314,7 +314,7 @@ async def delete_memo(memo_id: str, user: dict = Depends(get_current_user)):
             if not memo:
                 raise HTTPException(status_code=404, detail="Memo not found")
 
-            if not user["is_admin"] or memo["owner_id"] != user["id"]:
+            if not can_manage_project(cursor, memo["project_id"], user):
                 raise HTTPException(status_code=403, detail="Access denied")
 
             cursor.execute(
@@ -337,6 +337,17 @@ async def bulk_delete_memos(
             now = datetime.now()
             deleted_count = 0
             for memo_id in data.memoIds:
+                cursor.execute(
+                    """
+                    SELECT project_id
+                    FROM memos
+                    WHERE id = %s AND deleted_at IS NULL
+                    """,
+                    (memo_id,),
+                )
+                memo = cursor.fetchone()
+                if not memo or not can_manage_project(cursor, memo["project_id"], user):
+                    continue
                 cursor.execute(
                     "UPDATE memos SET deleted_at = %s WHERE id = %s AND deleted_at IS NULL",
                     (now, memo_id),
