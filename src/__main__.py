@@ -8,16 +8,12 @@ try:
     from .routers.articles import router as articles_router
     from .routers.memos import router as memos_router
     from .routers.projects import router as projects_router
-    from .routers.topics import router as topics_router
-    from .routers.topics import sources_router as topic_sources_router
     from .routers.daily_tasks import router as daily_tasks_router
 except ImportError:  # pragma: no cover
     from connectors import init_db
     from routers.articles import router as articles_router
     from routers.memos import router as memos_router
     from routers.projects import router as projects_router
-    from routers.topics import router as topics_router
-    from routers.topics import sources_router as topic_sources_router
     from routers.daily_tasks import router as daily_tasks_router
 
 
@@ -42,8 +38,6 @@ app.add_middleware(
 app.include_router(projects_router)
 app.include_router(memos_router)
 app.include_router(articles_router)
-app.include_router(topics_router)
-app.include_router(topic_sources_router)
 app.include_router(daily_tasks_router)
 
 

@@ -1,6 +1,6 @@
 # todo-api-fastapi
 
-FastAPI backend owning all data. Raw SQL via PyMySQL against MySQL. Single-file API.
+FastAPI backend for todo/project/memo/daily-task/article data. Raw SQL via PyMySQL against MySQL.
 
 > 이 파일이 본 레포의 canonical 가이드입니다. `AGENTS.md` 는 codex 호환용 stub 입니다.
 
@@ -28,13 +28,18 @@ FastAPI backend owning all data. Raw SQL via PyMySQL against MySQL. Single-file 
 
 ```
 src/
-├── __main__.py           # ALL routes + Pydantic models + startup event (single file, 394 lines)
+├── __main__.py           # FastAPI app setup and router registration
 ├── __init__.py           # Empty
 └── connectors/
     └── __init__.py       # DB config, get_db_connection() context manager, init_db() DDL
+scripts/
+└── export_topic_data.py  # Read-only legacy topic export for topic-api-fastapi migration
 Dockerfile                # Python 3.11-slim, port 8000
 requirements.txt          # fastapi 0.115.5, uvicorn, pymysql, pydantic 2, python-dotenv
 ```
+
+Topic collection/insight data and embedding similarity search moved to `../topic-api-fastapi`.
+This repo keeps only a read-only legacy export script until migration verification is complete.
 
 ## WHERE TO LOOK
 
@@ -44,6 +49,7 @@ requirements.txt          # fastapi 0.115.5, uvicorn, pymysql, pydantic 2, pytho
 | Change DB schema | `src/connectors/__init__.py` `init_db()` | DDL in raw SQL, auto-runs on startup |
 | DB connection | `src/connectors/__init__.py` `get_db_connection()` | Context manager with auto-commit/rollback |
 | Environment vars | `.env` → `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` | Loaded via `python-dotenv` |
+| Export legacy topic data | `scripts/export_topic_data.py` | Read-only JSON export for topic service import |
 
 ## DATABASE SCHEMA
 

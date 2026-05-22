@@ -1,3 +1,8 @@
+---
+status: COMPLETED
+summary: "todo-api-fastapi 에서 topic routes/schema/ML dependency 를 제거하고 topic data export 를 제공한다."
+---
+
 # TOPIC SERVICE SPLIT — todo-api-fastapi execution plan
 
 Canonical orchestration plan:
@@ -11,8 +16,9 @@ Canonical orchestration plan:
 ## Inputs / Dependencies
 
 - `topic-api-fastapi` must first expose compatible topic endpoints or the root plan must approve a contract change.
-- Existing topic data preservation must be decided before deleting or ignoring old topic tables.
+- Existing topic data preservation is decided: export current todo topic tables into migration artifacts, import them into the new topic DB, then remove todo runtime ownership.
 - Skill endpoint migration must be complete before removing todo topic routes.
+- Do not run automatic `DROP TABLE` or destructive DB cleanup in application startup.
 
 ## Work Items
 
@@ -23,22 +29,25 @@ Canonical orchestration plan:
    - router includes in `src/__main__.py`
    - topic DDL in `src/connectors/__init__.py`
    - topic dependencies in `requirements.txt`
-2. After topic service parity is confirmed, remove topic router includes from `src/__main__.py`.
-3. Remove topic models/router/services and any unused imports.
-4. Remove topic DDL side effects from `init_db()`.
-5. Remove `sentence-transformers` / PyTorch-related dependencies from todo requirements.
-6. Update `CLAUDE.md` to state that topic functionality moved to `topic-api-fastapi`.
+2. Add a non-destructive export script for topic tables (`topic_sources`, `topics`, `topic_references`, `topic_hashtags`, `topic_questions`, `topic_answers`, `topic_blog_posts`, `topic_insight_exchanges`) so data can be inserted into the new topic DB.
+3. After topic service parity and skill endpoint migration are confirmed, remove topic router includes from `src/__main__.py`.
+4. Remove topic models/router/services and any unused imports.
+5. Remove topic DDL side effects from `init_db()`. Do not drop existing DB tables automatically.
+6. Remove `sentence-transformers` / PyTorch-related dependencies from todo requirements.
+7. Update `CLAUDE.md` to state that topic functionality moved to `topic-api-fastapi`.
 
 ## Acceptance Criteria
 
 - `todo-api-fastapi` starts without topic routes.
 - Todo-owned endpoints for projects, memos, articles, and daily tasks still pass smoke tests.
+- Topic data export script can produce a migration artifact without mutating the todo DB.
 - `rg "topic_" src requirements.txt` has no active todo runtime code matches, except intentional migration/handoff documentation.
 - Todo dependency installation or Docker build no longer installs topic ML dependencies.
 
 ## Report Back To Orchestrator
 
-- Whether existing topic tables/data are left in MySQL, migrated, or intentionally ignored.
+- Topic export artifact path and any assumptions required by topic import.
+- Confirmation that existing topic tables are not automatically dropped by app startup.
 - Any todo endpoint or frontend path that still depends on removed topic routes.
 - Any dependency that cannot be removed because another todo feature uses it.
 
