@@ -1,5 +1,5 @@
 ---
-status: PREPARED
+status: COMPLETED
 summary: "todo-api-fastapi가 todo session/auth, Python Socket.IO, LiveKit token, REST API를 직접 소유하게 한다."
 ---
 
