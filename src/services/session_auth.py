@@ -1,6 +1,6 @@
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.cookies import SimpleCookie
 from threading import RLock
 from time import time
@@ -11,8 +11,9 @@ from fastapi import HTTPException, Request, Response
 
 try:
     from ..config import (
-        AUTH_ADMIN_API_KEY,
         AUTH_API_BASE_URL,
+        AUTH_SERVICE_KEY_ID,
+        AUTH_SERVICE_SECRET,
         TODO_OIDC_CLIENT_ID,
         TODO_OIDC_CLIENT_SECRET,
         TODO_OIDC_REDIRECT_URI,
@@ -25,8 +26,9 @@ try:
     from ..token_verifier import build_user_from_payload, decode_auth_api_token, serialize_user
 except ImportError:  # pragma: no cover
     from config import (
-        AUTH_ADMIN_API_KEY,
         AUTH_API_BASE_URL,
+        AUTH_SERVICE_KEY_ID,
+        AUTH_SERVICE_SECRET,
         TODO_OIDC_CLIENT_ID,
         TODO_OIDC_CLIENT_SECRET,
         TODO_OIDC_REDIRECT_URI,
@@ -51,6 +53,7 @@ class TodoSession:
     refresh_token: str
     access_token_expires_at: float
     user: dict
+    refresh_lock: Any = field(default_factory=RLock)
 
 
 @dataclass
@@ -119,8 +122,13 @@ class TodoSessionService:
         )
 
     async def search_accounts(self, query: str) -> list[dict]:
+        if not AUTH_SERVICE_KEY_ID or not AUTH_SERVICE_SECRET:
+            raise HTTPException(
+                status_code=503,
+                detail="Auth service credential is required for account search",
+            )
         url = (
-            f"{self.auth_api_base_url}/api/admin/accounts/service-search"
+            f"{self.auth_api_base_url}/api/internal/service-accounts/search"
             f"?serviceKey=todo&q={parse.quote(query)}"
         )
         response = await asyncio.to_thread(
@@ -128,7 +136,10 @@ class TodoSessionService:
             "GET",
             url,
             None,
-            {"x-admin-key": AUTH_ADMIN_API_KEY},
+            {
+                "x-auth-service-key-id": AUTH_SERVICE_KEY_ID,
+                "x-auth-service-secret": AUTH_SERVICE_SECRET,
+            },
             None,
         )
         if not 200 <= response.status < 300:
@@ -262,23 +273,40 @@ class TodoSessionService:
             raise HTTPException(status_code=401, detail="Todo session is required")
 
         if session.access_token_expires_at - time() <= 30:
-            try:
-                token = self._request_token(
-                    {
-                        "grant_type": "refresh_token",
-                        "client_id": self.client_id,
-                        "client_secret": self.client_secret,
-                        "refresh_token": session.refresh_token,
-                    }
-                )
-            except HTTPException as exc:
-                self._delete_session(session_id)
-                raise HTTPException(status_code=401, detail=exc.detail) from exc
+            with session.refresh_lock:
+                session = self._get_session_by_id(session_id)
+                if session is None:
+                    raise HTTPException(status_code=401, detail="Todo session is required")
+                if session.access_token_expires_at - time() > 30:
+                    return session
 
-            updated = self._create_session(token, session_id=session_id)
-            with self._lock:
-                self._sessions[session_id] = updated
-            session = updated
+                refresh_token = session.refresh_token
+                refresh_lock = session.refresh_lock
+
+                try:
+                    token = self._request_token(
+                        {
+                            "grant_type": "refresh_token",
+                            "client_id": self.client_id,
+                            "client_secret": self.client_secret,
+                            "refresh_token": refresh_token,
+                        }
+                    )
+                except HTTPException as exc:
+                    with self._lock:
+                        current = self._sessions.get(session_id)
+                        if current is not None and current.refresh_token == refresh_token:
+                            self._sessions.pop(session_id, None)
+                    raise HTTPException(status_code=401, detail=exc.detail) from exc
+
+                updated = self._create_session(
+                    token,
+                    session_id=session_id,
+                    refresh_lock=refresh_lock,
+                )
+                with self._lock:
+                    self._sessions[session_id] = updated
+                session = updated
 
         return session
 
@@ -293,7 +321,12 @@ class TodoSessionService:
         if response.status >= 500:
             return
 
-    def _create_session(self, token: dict, session_id: str | None = None) -> TodoSession:
+    def _create_session(
+        self,
+        token: dict,
+        session_id: str | None = None,
+        refresh_lock: Any | None = None,
+    ) -> TodoSession:
         access_token = token.get("access_token")
         refresh_token = token.get("refresh_token")
         expires_in = token.get("expires_in")
@@ -308,6 +341,7 @@ class TodoSessionService:
             refresh_token=refresh_token,
             access_token_expires_at=time() + int(expires_in),
             user=user,
+            refresh_lock=refresh_lock or RLock(),
         )
 
     def _get_request_session(self, request_obj: Request) -> TodoSession | None:

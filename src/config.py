@@ -37,11 +37,8 @@ TODO_SESSION_MAX_AGE_SECONDS = int(
     os.getenv("TODO_SESSION_MAX_AGE_SECONDS", str(7 * 24 * 60 * 60))
 )
 
-AUTH_ADMIN_API_KEY = (
-    os.getenv("AUTH_ADMIN_API_KEY")
-    or os.getenv("ADMIN_API_KEY")
-    or "dev-admin-key"
-)
+AUTH_SERVICE_KEY_ID = os.getenv("AUTH_SERVICE_KEY_ID", "").strip()
+AUTH_SERVICE_SECRET = os.getenv("AUTH_SERVICE_SECRET", "").strip()
 
 LIVEKIT_URL = os.getenv("LIVEKIT_URL", "").strip()
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "").strip()
