@@ -1,3 +1,10 @@
+---
+status: COMPLETED
+completed_at: 2026-05-24
+completion_reason: "Completed by the later todo DB migration work: todo now runs on the new todo DB, central auth/session integration is implemented, legacy users were removed, and legacy teddynote data was migrated into the current schema per updated user decisions."
+summary: "`todo` DB/auth 전환 계획은 이후 결정된 legacy teddynote 데이터 이관과 중앙 auth 세션 구조로 구현 완료되었다."
+---
+
 # Fresh Todo DB + Auth Migration Plan
 
 ## Goal
