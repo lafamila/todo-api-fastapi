@@ -78,6 +78,7 @@ class Project(BaseModel):
     id: str
     name: str
     icon: str
+    status: int = 0
     isSecret: bool
     createdAt: datetime
     updatedAt: datetime
@@ -88,5 +89,6 @@ class Memo(BaseModel):
     projectId: str
     title: str
     content: str
+    status: int = 0
     createdAt: datetime
     updatedAt: datetime

@@ -54,6 +54,7 @@ def init_db():
                     id VARCHAR(50) PRIMARY KEY,
                     name VARCHAR(255) NOT NULL,
                     icon VARCHAR(10) NOT NULL,
+                    status INT NOT NULL DEFAULT 0,
                     is_secret BOOLEAN DEFAULT FALSE,
                     password VARCHAR(255),
                     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -70,6 +71,7 @@ def init_db():
                     project_id VARCHAR(50) NOT NULL,
                     title VARCHAR(255) NOT NULL,
                     content LONGTEXT,
+                    status INT NOT NULL DEFAULT 0,
                     deleted_at DATETIME NULL DEFAULT NULL,
                     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -144,6 +146,16 @@ def init_db():
                 cursor.execute("ALTER TABLE memos ADD COLUMN deleted_at DATETIME NULL DEFAULT NULL AFTER content")
             except Exception:
                 pass  # 이미 컬럼이 존재하는 경우
+
+            try:
+                cursor.execute("ALTER TABLE projects ADD COLUMN status INT NOT NULL DEFAULT 0 AFTER icon")
+            except Exception:
+                pass
+
+            try:
+                cursor.execute("ALTER TABLE memos ADD COLUMN status INT NOT NULL DEFAULT 0 AFTER content")
+            except Exception:
+                pass
 
             try:
                 cursor.execute("ALTER TABLE projects ADD COLUMN owner_id VARCHAR(50) NULL AFTER id")

@@ -169,7 +169,7 @@ async def get_projects(user: dict = Depends(get_current_user)):
             if user.get("permission") == "owner":
                 cursor.execute(
                     """
-                    SELECT DISTINCT p.id, p.name, p.icon, p.is_secret, p.owner_id, p.created_at, p.updated_at
+                    SELECT DISTINCT p.id, p.name, p.icon, p.status, p.is_secret, p.owner_id, p.created_at, p.updated_at
                     FROM projects p
                     ORDER BY p.created_at DESC
                 """
@@ -177,7 +177,7 @@ async def get_projects(user: dict = Depends(get_current_user)):
             elif user["is_admin"]:
                 cursor.execute(
                     """
-                    SELECT DISTINCT p.id, p.name, p.icon, p.is_secret, p.owner_id, p.created_at, p.updated_at
+                    SELECT DISTINCT p.id, p.name, p.icon, p.status, p.is_secret, p.owner_id, p.created_at, p.updated_at
                     FROM projects p
                     LEFT JOIN project_members pm ON p.id = pm.project_id AND pm.user_id = %s
                     WHERE p.owner_id = %s OR pm.user_id = %s
@@ -188,7 +188,7 @@ async def get_projects(user: dict = Depends(get_current_user)):
             else:
                 cursor.execute(
                     """
-                    SELECT p.id, p.name, p.icon, p.is_secret, p.owner_id, p.created_at, p.updated_at
+                    SELECT p.id, p.name, p.icon, p.status, p.is_secret, p.owner_id, p.created_at, p.updated_at
                     FROM projects p
                     JOIN project_members pm ON p.id = pm.project_id
                     WHERE pm.user_id = %s
@@ -204,6 +204,7 @@ async def get_projects(user: dict = Depends(get_current_user)):
                     "id": p["id"],
                     "name": p["name"],
                     "icon": p["icon"],
+                    "status": p["status"],
                     "isSecret": bool(p["is_secret"]),
                     "ownerId": p["owner_id"],
                     "createdAt": p["created_at"].isoformat(),
@@ -226,14 +227,15 @@ async def create_project(
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                INSERT INTO projects (id, owner_id, name, icon, is_secret, password, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO projects (id, owner_id, name, icon, status, is_secret, password, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
                 (
                     project_id,
                     user["id"],
                     data.name,
                     data.icon,
+                    0,
                     data.isSecret,
                     data.password,
                     now,
@@ -262,6 +264,7 @@ async def create_project(
         "id": project_id,
         "name": data.name,
         "icon": data.icon,
+        "status": 0,
         "isSecret": data.isSecret,
         "ownerId": user["id"],
         "createdAt": now.isoformat(),

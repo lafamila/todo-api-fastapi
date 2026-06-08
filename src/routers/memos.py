@@ -39,7 +39,7 @@ async def get_project_memos(project_id: str, user: dict = Depends(get_current_us
 
             cursor.execute(
                 """
-                SELECT id, project_id, created_by, title, content, created_at, updated_at
+                SELECT id, project_id, created_by, title, content, status, created_at, updated_at
                 FROM memos
                 WHERE project_id = %s AND deleted_at IS NULL
                 ORDER BY created_at DESC
@@ -55,6 +55,7 @@ async def get_project_memos(project_id: str, user: dict = Depends(get_current_us
                     "createdBy": m["created_by"],
                     "title": m["title"],
                     "content": m["content"],
+                    "status": m["status"],
                     "createdAt": m["created_at"].isoformat(),
                     "updatedAt": m["updated_at"].isoformat(),
                 }
@@ -93,10 +94,10 @@ async def create_memo(data: CreateMemoRequest, user: dict = Depends(get_current_
 
             cursor.execute(
                 """
-                INSERT INTO memos (id, project_id, created_by, title, content, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO memos (id, project_id, created_by, title, content, status, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
-                (memo_id, data.projectId, user["id"], data.title, "", now, now),
+                (memo_id, data.projectId, user["id"], data.title, "", 0, now, now),
             )
 
     return {
@@ -105,6 +106,7 @@ async def create_memo(data: CreateMemoRequest, user: dict = Depends(get_current_
         "createdBy": user["id"],
         "title": data.title,
         "content": "",
+        "status": 0,
         "createdAt": now.isoformat(),
         "updatedAt": now.isoformat(),
     }
@@ -117,7 +119,7 @@ async def get_memo(memo_id: str, user: dict = Depends(get_current_user)):
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, project_id, created_by, title, content, created_at, updated_at
+                SELECT id, project_id, created_by, title, content, status, created_at, updated_at
                 FROM memos
                 WHERE id = %s AND deleted_at IS NULL
             """,
@@ -137,6 +139,7 @@ async def get_memo(memo_id: str, user: dict = Depends(get_current_user)):
                 "createdBy": memo["created_by"],
                 "title": memo["title"],
                 "content": memo["content"],
+                "status": memo["status"],
                 "createdAt": memo["created_at"].isoformat(),
                 "updatedAt": memo["updated_at"].isoformat(),
             }
@@ -198,7 +201,7 @@ async def update_memo(
 
             cursor.execute(
                 """
-                SELECT id, project_id, created_by, title, content, created_at, updated_at
+                SELECT id, project_id, created_by, title, content, status, created_at, updated_at
                 FROM memos
                 WHERE id = %s AND deleted_at IS NULL
             """,
@@ -212,6 +215,7 @@ async def update_memo(
                 "createdBy": updated_memo["created_by"],
                 "title": updated_memo["title"],
                 "content": updated_memo["content"],
+                "status": updated_memo["status"],
                 "createdAt": updated_memo["created_at"].isoformat(),
                 "updatedAt": updated_memo["updated_at"].isoformat(),
             }
