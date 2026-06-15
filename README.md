@@ -40,13 +40,15 @@ DB_PASSWORD=your_password
 DB_NAME=todo
 ```
 
-Auth 계정 검색 기능을 사용하려면 `auth-api-nest` 에서 todo 서비스용 service credential 을 생성한 뒤 서버 환경변수로 주입해야 합니다. 이 값은 서버 전용 secret 이며 프론트엔드에 노출하면 안 됩니다.
+Auth 계정 검색 기능을 사용하려면 `auth-api-nest` 에 todo 서비스 onboarding request 를 제출하고, `/admin` 에서 승인된 뒤 표시되는 todo 서비스용 service credential 을 서버 환경변수로 주입해야 합니다. 이 값은 승인/rotate 시 한 번만 표시되는 서버 전용 secret 이며 프론트엔드에 노출하면 안 됩니다.
 
 ```env
 AUTH_API_BASE_URL=http://localhost:3032
 AUTH_SERVICE_KEY_ID=todo_service_key_id
 AUTH_SERVICE_SECRET=todo_service_secret
 ```
+
+Todo OIDC client, permission definitions, service credential scope 변경은 auth admin 에서 직접 수정하지 않고 todo 서비스가 service onboarding update request 를 제출한 뒤 승인받는 방식으로 진행합니다.
 
 ### 3. 서버 실행
 
