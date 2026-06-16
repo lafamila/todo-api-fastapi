@@ -1,6 +1,10 @@
 import os
 from urllib.parse import urlsplit
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 def _get_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)

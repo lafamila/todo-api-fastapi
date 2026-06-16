@@ -2,6 +2,7 @@ import unittest
 from urllib.parse import parse_qs, urlsplit
 
 from src.services import session_auth
+from src import token_verifier
 
 
 class TodoSessionServiceOidcTests(unittest.IsolatedAsyncioTestCase):
@@ -117,6 +118,27 @@ class TodoSessionServiceOidcTests(unittest.IsolatedAsyncioTestCase):
             self.service._login_transactions[state].return_to_path,
             session_auth.TODO_WEB_DEFAULT_RETURN_PATH,
         )
+
+
+class TodoTokenVerifierTests(unittest.TestCase):
+    def test_builds_superadmin_user_from_auth_service_claim(self) -> None:
+        user = token_verifier.build_user_from_payload(
+            {
+                "sub": "account-1",
+                "preferred_username": "lafamila",
+                "name": "Lafamila",
+                "email": "lafamila@example.test",
+                token_verifier.SERVICE_CLAIM: {
+                    "key": "todo",
+                    "permission": "superadmin",
+                    "permissionSchemaVersion": 1,
+                },
+            }
+        )
+
+        self.assertEqual(user["permission"], "superadmin")
+        self.assertTrue(user["is_admin"])
+        self.assertTrue(user["is_super_admin"])
 
 
 if __name__ == "__main__":

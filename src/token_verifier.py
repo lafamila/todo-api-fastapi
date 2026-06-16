@@ -22,8 +22,8 @@ except ImportError:  # pragma: no cover
 
 
 SERVICE_CLAIM = "https://lafamila.xyz/claims/service"
-SERVICE_PERMISSIONS = {"owner", "admin", "user", "visitor"}
-ADMIN_PERMISSIONS = {"owner", "admin"}
+SERVICE_PERMISSIONS = {"superadmin", "owner", "admin", "user", "visitor"}
+ADMIN_PERMISSIONS = {"superadmin", "owner", "admin"}
 
 _jwks_cache: dict | None = None
 _jwks_cache_expires_at = 0.0
@@ -94,7 +94,7 @@ def build_user_from_payload(payload: dict) -> dict:
         "permission": permission,
         "slug": slugify(str(login_id)),
         "is_admin": permission in ADMIN_PERMISSIONS,
-        "is_super_admin": permission == "owner",
+        "is_super_admin": permission == "superadmin",
         "is_active": permission != "visitor",
     }
 
