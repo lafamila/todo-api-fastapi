@@ -1,4 +1,4 @@
-# backend/Dockerfile
+# Standalone deploy image for the todo-api-fastapi backend.
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -19,7 +19,7 @@ COPY requirements.txt .
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt
 
-# app source ('.env'는 이미지에 복사하지 않음)
+# app source ('.env'는 이미지에 복사하지 않고 런타임 env 로 주입)
 COPY src/ ./src/
 
 EXPOSE 8000

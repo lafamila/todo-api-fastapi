@@ -2,6 +2,8 @@
 
 Todo 백엔드 API 서버입니다. FastAPI와 MariaDB를 사용하여 구현되었습니다.
 
+이 레포는 `todo-api-fastapi` 단독 배포를 기준으로 관리합니다. root `docker-compose*.yml` 은 이 앱을 띄우는 용도가 아니라 MariaDB, LiveKit 같은 공통 infra 를 띄우는 용도로만 취급합니다.
+
 ## 기술 스택
 
 - **프레임워크**: FastAPI
@@ -30,7 +32,7 @@ pip install -r requirements.txt
 
 ### 2. MariaDB 설정
 
-MariaDB가 설치되어 있어야 합니다. `.env` 파일에서 데이터베이스 연결 정보를 설정하세요:
+MariaDB는 root infra compose 또는 별도 운영 DB 를 사용하면 됩니다. 로컬 실행 전에는 `.env.example` 을 복사해 `.env` 를 만들고 환경변수를 채우세요:
 
 ```env
 DB_HOST=localhost
@@ -58,6 +60,8 @@ Todo OIDC client, permission definitions, service credential scope 변경은 aut
 
 ### 3. 서버 실행
 
+로컬 개발 실행:
+
 ```bash
 python -m src
 ```
@@ -70,6 +74,23 @@ python __main__.py
 ```
 
 서버는 `http://localhost:8000`에서 실행됩니다.
+
+### 4. Docker 이미지 빌드
+
+독립 배포용 이미지 빌드:
+
+```bash
+docker build -t todo-api-fastapi .
+```
+
+이미지 실행 시 `.env` 또는 운영 환경변수를 런타임에 주입하세요. 이 레포는 더 이상 root compose 의 `fastapi` 앱 서비스명을 기준으로 설명하지 않습니다.
+
+## 배포/연동 메모
+
+- DB 는 root infra compose 의 MariaDB/MySQL 또는 운영 DB 를 사용합니다.
+- Auth 는 독립 배포된 `auth-api-nest` 의 URL/JWKS/service credential 을 사용합니다.
+- LiveKit 토큰 API 를 쓰는 경우 `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` 를 별도 주입해야 합니다.
+- 프론트엔드 origin 과 세션 쿠키 동작은 `TODO_ALLOWED_ORIGINS`, `TODO_SESSION_COOKIE_*`, `TODO_WEB_BASE_URL` 로 맞춥니다.
 
 ## API 엔드포인트
 
