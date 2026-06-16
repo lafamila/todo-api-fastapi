@@ -40,10 +40,16 @@ DB_PASSWORD=your_password
 DB_NAME=todo
 ```
 
+Todo 로그인은 auth-api-nest hosted OIDC login 을 통해 시작됩니다. todo-api-fastapi 는 브라우저로부터 중앙 계정 ID/PW 를 받지 않고, `/api/session/oidc/start` 에서 authorize URL 을 발급한 뒤 `TODO_OIDC_REDIRECT_URI` callback 에서 code 를 교환해 todo 세션 쿠키를 만듭니다.
+
 Auth 계정 검색 기능을 사용하려면 `auth-api-nest` 에 todo 서비스 onboarding request 를 제출하고, `/admin` 에서 승인된 뒤 표시되는 todo 서비스용 service credential 을 서버 환경변수로 주입해야 합니다. 이 값은 승인/rotate 시 한 번만 표시되는 서버 전용 secret 이며 프론트엔드에 노출하면 안 됩니다.
 
 ```env
 AUTH_API_BASE_URL=http://localhost:3032
+TODO_OIDC_CLIENT_ID=todo-web
+TODO_OIDC_CLIENT_SECRET=todo_oidc_client_secret
+TODO_OIDC_REDIRECT_URI=http://localhost:8000/api/todo/session/callback
+TODO_WEB_BASE_URL=http://localhost:3034
 AUTH_SERVICE_KEY_ID=todo_service_key_id
 AUTH_SERVICE_SECRET=todo_service_secret
 ```
@@ -66,6 +72,13 @@ python __main__.py
 서버는 `http://localhost:8000`에서 실행됩니다.
 
 ## API 엔드포인트
+
+### Session API
+
+- `POST /api/session/oidc/start` - auth-api authorize URL 생성
+- `GET /api/todo/session/callback` - auth callback code 를 todo 세션 쿠키로 교환
+- `GET /api/session/me` - 현재 todo 세션 조회
+- `POST /api/session/logout` - todo 세션 종료
 
 ### Projects API
 
@@ -114,8 +127,7 @@ python __main__.py
 
 ## CORS 설정
 
-프론트엔드 개발 서버(`http://localhost:3031`)와의 통신을 위해 CORS가 설정되어 있습니다.
-다른 origin에서 접근이 필요한 경우 `src/__main__.py`의 CORS 설정을 수정하세요.
+프론트엔드 개발 서버 origin 은 `TODO_ALLOWED_ORIGINS` 환경변수에서 관리합니다.
 
 ## 자동 초기화
 

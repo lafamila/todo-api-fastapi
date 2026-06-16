@@ -8,6 +8,7 @@ from typing import Any
 from urllib import error, parse, request
 
 from fastapi import HTTPException, Request, Response
+from fastapi.responses import RedirectResponse
 
 try:
     from ..config import (
@@ -16,12 +17,14 @@ try:
         AUTH_SERVICE_SECRET,
         TODO_OIDC_CLIENT_ID,
         TODO_OIDC_CLIENT_SECRET,
+        TODO_OIDC_CALLBACK_ROUTE_PATH,
         TODO_OIDC_REDIRECT_URI,
         TODO_SESSION_COOKIE_DOMAIN,
         TODO_SESSION_COOKIE_NAME,
         TODO_SESSION_COOKIE_SAMESITE,
         TODO_SESSION_COOKIE_SECURE,
         TODO_SESSION_MAX_AGE_SECONDS,
+        TODO_WEB_BASE_URL,
     )
     from ..token_verifier import build_user_from_payload, decode_auth_api_token, serialize_user
 except ImportError:  # pragma: no cover
@@ -31,12 +34,14 @@ except ImportError:  # pragma: no cover
         AUTH_SERVICE_SECRET,
         TODO_OIDC_CLIENT_ID,
         TODO_OIDC_CLIENT_SECRET,
+        TODO_OIDC_CALLBACK_ROUTE_PATH,
         TODO_OIDC_REDIRECT_URI,
         TODO_SESSION_COOKIE_DOMAIN,
         TODO_SESSION_COOKIE_NAME,
         TODO_SESSION_COOKIE_SAMESITE,
         TODO_SESSION_COOKIE_SECURE,
         TODO_SESSION_MAX_AGE_SECONDS,
+        TODO_WEB_BASE_URL,
     )
     from token_verifier import build_user_from_payload, decode_auth_api_token, serialize_user
 
@@ -44,6 +49,12 @@ except ImportError:  # pragma: no cover
 class _NoRedirectHandler(request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+LOGIN_SCOPE = "openid profile email service.permission"
+LOGIN_TRANSACTION_TTL_SECONDS = 10 * 60
+TODO_WEB_DEFAULT_RETURN_PATH = "/"
+TODO_WEB_LOGIN_PATH = "/login"
 
 
 @dataclass
@@ -63,20 +74,61 @@ class _HttpResponse:
     data: Any
 
 
+@dataclass
+class OidcLoginTransaction:
+    state: str
+    code_verifier: str
+    return_to_path: str
+    created_at: float
+
+
+@dataclass
+class _CallbackResult:
+    redirect_url: str
+    session_id: str | None = None
+
+
+class OidcCallbackError(Exception):
+    def __init__(self, error_code: str, description: str):
+        super().__init__(description)
+        self.error_code = error_code
+        self.description = description
+
+
 class TodoSessionService:
     def __init__(self) -> None:
         self.auth_api_base_url = AUTH_API_BASE_URL
         self.client_id = TODO_OIDC_CLIENT_ID
         self.client_secret = TODO_OIDC_CLIENT_SECRET
         self.redirect_uri = TODO_OIDC_REDIRECT_URI
+        self.callback_route_path = TODO_OIDC_CALLBACK_ROUTE_PATH
         self.cookie_name = TODO_SESSION_COOKIE_NAME
         self._sessions: dict[str, TodoSession] = {}
+        self.todo_web_base_url = TODO_WEB_BASE_URL
+        self._login_transactions: dict[str, OidcLoginTransaction] = {}
         self._lock = RLock()
 
-    async def login(self, login_id: str, password: str, response: Response) -> dict:
-        session = await asyncio.to_thread(self._login_sync, login_id, password)
-        self._set_session_cookie(response, session.id)
-        return serialize_user(session.user)
+    async def start_login(self, return_to: str | None) -> dict:
+        return await asyncio.to_thread(self._start_login_sync, return_to)
+
+    async def handle_oidc_callback(
+        self,
+        code: str | None,
+        state: str | None,
+        error: str | None,
+        error_description: str | None,
+    ) -> RedirectResponse:
+        result = await asyncio.to_thread(
+            self._handle_oidc_callback_sync,
+            code,
+            state,
+            error,
+            error_description,
+        )
+        response = RedirectResponse(result.redirect_url, status_code=302)
+        if result.session_id:
+            self._set_session_cookie(response, result.session_id)
+        return response
 
     async def logout(self, request: Request, response: Response) -> None:
         session = self._get_request_session(request)
@@ -180,12 +232,101 @@ class TodoSessionService:
     def is_session_configured(self) -> bool:
         return True
 
-    def _login_sync(self, login_id: str, password: str) -> TodoSession:
-        auth_cookie = self._create_auth_api_session(login_id, password)
+    def _start_login_sync(self, return_to: str | None) -> dict:
+        self._prune_expired_login_transactions()
+        self._ensure_oidc_configured()
+
+        state = _random_token(24)
         code_verifier = _random_token(48)
         code_challenge = _code_challenge(code_verifier)
-        code = self._authorize(auth_cookie, code_challenge)
-        token = self._request_token(
+        transaction = OidcLoginTransaction(
+            state=state,
+            code_verifier=code_verifier,
+            return_to_path=_normalize_return_to_path(return_to),
+            created_at=time(),
+        )
+        with self._lock:
+            self._login_transactions[state] = transaction
+
+        return {
+            "authorizeUrl": self._build_authorize_url(state, code_challenge),
+        }
+
+    def _handle_oidc_callback_sync(
+        self,
+        code: str | None,
+        state: str | None,
+        error_code: str | None,
+        error_description: str | None,
+    ) -> _CallbackResult:
+        self._prune_expired_login_transactions()
+
+        transaction = self._pop_login_transaction(state)
+        if error_code:
+            return _CallbackResult(
+                redirect_url=self._build_error_redirect_url(
+                    error_code,
+                    error_description or "Authorization was denied",
+                )
+            )
+        if transaction is None:
+            return _CallbackResult(
+                redirect_url=self._build_error_redirect_url(
+                    "invalid_state",
+                    "Login transaction expired or was not found",
+                )
+            )
+        if not code:
+            return _CallbackResult(
+                redirect_url=self._build_error_redirect_url(
+                    "invalid_request",
+                    "Authorization code is missing",
+                )
+            )
+
+        try:
+            token = self._exchange_code_for_token(code, transaction.code_verifier)
+            session = self._create_session(token)
+            self._store_session(session)
+        except OidcCallbackError as exc:
+            return _CallbackResult(
+                redirect_url=self._build_error_redirect_url(
+                    exc.error_code,
+                    exc.description,
+                )
+            )
+        except HTTPException as exc:
+            return _CallbackResult(
+                redirect_url=self._build_error_redirect_url(
+                    "callback_failed",
+                    _stringify_error_detail(exc.detail, "OIDC callback failed"),
+                )
+            )
+
+        return _CallbackResult(
+            redirect_url=self._build_success_redirect_url(transaction.return_to_path),
+            session_id=session.id,
+        )
+
+    def _build_authorize_url(self, state: str, code_challenge: str) -> str:
+        params = parse.urlencode(
+            {
+                "client_id": self.client_id,
+                "redirect_uri": self.redirect_uri,
+                "response_type": "code",
+                "scope": LOGIN_SCOPE,
+                "state": state,
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256",
+            }
+        )
+        return f"{self.auth_api_base_url}/oauth/authorize?{params}"
+
+    def _exchange_code_for_token(self, code: str, code_verifier: str) -> dict:
+        self._ensure_oidc_configured()
+        response = self._request_json(
+            "POST",
+            f"{self.auth_api_base_url}/oauth/token",
             {
                 "grant_type": "authorization_code",
                 "client_id": self.client_id,
@@ -193,61 +334,20 @@ class TodoSessionService:
                 "redirect_uri": self.redirect_uri,
                 "code": code,
                 "code_verifier": code_verifier,
-            }
-        )
-        session = self._create_session(token)
-        self._store_session(session)
-        return session
-
-    def _create_auth_api_session(self, login_id: str, password: str) -> str:
-        response = self._request_json(
-            "POST",
-            f"{self.auth_api_base_url}/login",
-            {"loginId": login_id, "password": password},
+            },
             None,
             None,
         )
         if not 200 <= response.status < 300:
-            raise HTTPException(
-                status_code=response.status,
-                detail=_extract_error_detail(response.data, "Central login failed"),
+            error_code, description = _extract_oidc_error(
+                response.data,
+                fallback_error="token_exchange_failed",
+                fallback_description="Token exchange failed",
             )
-        cookies = response.headers.get_all("Set-Cookie") if response.headers else []
-        auth_cookies = [cookie.split(";", 1)[0] for cookie in cookies if cookie]
-        if not auth_cookies:
-            raise HTTPException(status_code=503, detail="Auth session cookie missing")
-        return "; ".join(auth_cookies)
-
-    def _authorize(self, auth_cookie: str, code_challenge: str) -> str:
-        authorize_url = (
-            f"{self.auth_api_base_url}/oauth/authorize"
-            f"?client_id={parse.quote(self.client_id)}"
-            f"&redirect_uri={parse.quote(self.redirect_uri, safe='')}"
-            "&response_type=code"
-            "&scope=openid%20profile%20email%20service.permission"
-            f"&state={parse.quote(_random_token(16))}"
-            f"&code_challenge={parse.quote(code_challenge)}"
-            "&code_challenge_method=S256"
-        )
-        response = self._request_json(
-            "GET",
-            authorize_url,
-            None,
-            {"Cookie": auth_cookie},
-            {302, 303, 307, 308},
-        )
-        location = response.headers.get("Location") if response.headers else None
-        if not location:
-            raise HTTPException(status_code=503, detail="Authorize redirect missing")
-        redirect_url = parse.urlparse(location)
-        params = parse.parse_qs(redirect_url.query)
-        if "error" in params:
-            detail = params.get("error_description", params["error"])[0]
-            raise HTTPException(status_code=401, detail=detail)
-        codes = params.get("code")
-        if not codes:
-            raise HTTPException(status_code=503, detail="Authorization code missing")
-        return codes[0]
+            raise OidcCallbackError(error_code, description)
+        if not isinstance(response.data, dict):
+            raise OidcCallbackError("token_exchange_failed", "Invalid token response")
+        return response.data
 
     def _request_token(self, body: dict[str, Any]) -> dict:
         clean_body = {key: value for key, value in body.items() if value is not None}
@@ -362,6 +462,23 @@ class TodoSessionService:
         with self._lock:
             self._sessions.pop(session_id, None)
 
+    def _pop_login_transaction(self, state: str | None) -> OidcLoginTransaction | None:
+        if not state:
+            return None
+        with self._lock:
+            return self._login_transactions.pop(state, None)
+
+    def _prune_expired_login_transactions(self) -> None:
+        cutoff = time() - LOGIN_TRANSACTION_TTL_SECONDS
+        with self._lock:
+            expired_states = [
+                state
+                for state, transaction in self._login_transactions.items()
+                if transaction.created_at < cutoff
+            ]
+            for state in expired_states:
+                self._login_transactions.pop(state, None)
+
     def _set_session_cookie(self, response: Response, session_id: str) -> None:
         response.set_cookie(
             key=self.cookie_name,
@@ -390,6 +507,29 @@ class TodoSessionService:
         cookie.load(cookie_header)
         morsel = cookie.get(self.cookie_name)
         return morsel.value if morsel else None
+
+    def _build_success_redirect_url(self, return_to_path: str) -> str:
+        return _join_base_and_path(self.todo_web_base_url, return_to_path)
+
+    def _build_error_redirect_url(self, error_code: str, error_description: str) -> str:
+        query = parse.urlencode(
+            {
+                "error": error_code,
+                "error_description": error_description,
+            }
+        )
+        return (
+            f"{_join_base_and_path(self.todo_web_base_url, TODO_WEB_LOGIN_PATH)}?{query}"
+        )
+
+    def _ensure_oidc_configured(self) -> None:
+        if not self.client_id:
+            raise HTTPException(status_code=503, detail="TODO_OIDC_CLIENT_ID is required")
+        if not self.redirect_uri:
+            raise HTTPException(
+                status_code=503,
+                detail="TODO_OIDC_REDIRECT_URI is required",
+            )
 
     def _request_json(
         self,
@@ -471,3 +611,46 @@ def _code_challenge(code_verifier: str) -> str:
 
     digest = hashlib.sha256(code_verifier.encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _extract_oidc_error(
+    data: Any,
+    fallback_error: str,
+    fallback_description: str,
+) -> tuple[str, str]:
+    if isinstance(data, dict):
+        error_code = str(data.get("error") or fallback_error)
+        description = _stringify_error_detail(
+            data.get("error_description")
+            or data.get("detail")
+            or data.get("message"),
+            fallback_description,
+        )
+        return error_code, description
+    return fallback_error, _stringify_error_detail(data, fallback_description)
+
+
+def _stringify_error_detail(detail: Any, fallback: str) -> str:
+    if isinstance(detail, str) and detail.strip():
+        return detail
+    if isinstance(detail, list) and detail:
+        rendered = ", ".join(str(item) for item in detail if item)
+        if rendered:
+            return rendered
+    return fallback
+
+
+def _normalize_return_to_path(return_to: str | None) -> str:
+    if not return_to:
+        return TODO_WEB_DEFAULT_RETURN_PATH
+    parsed = parse.urlsplit(return_to)
+    if parsed.scheme or parsed.netloc:
+        return TODO_WEB_DEFAULT_RETURN_PATH
+    path = parsed.path or TODO_WEB_DEFAULT_RETURN_PATH
+    if not path.startswith("/"):
+        path = f"/{path}"
+    return parse.urlunsplit(("", "", path, parsed.query, parsed.fragment))
+
+
+def _join_base_and_path(base_url: str, path: str) -> str:
+    return f"{base_url.rstrip('/')}{path if path.startswith('/') else f'/{path}'}"

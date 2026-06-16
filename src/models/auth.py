@@ -3,9 +3,8 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
-class SessionLoginRequest(BaseModel):
-    loginId: str = Field(min_length=1)
-    password: str = Field(min_length=1)
+class SessionOidcStartRequest(BaseModel):
+    returnTo: Optional[str] = None
 
 
 class ServiceApplicationRequest(BaseModel):

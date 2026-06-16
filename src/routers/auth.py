@@ -2,16 +2,22 @@ from fastapi import APIRouter, Depends, Query, Request, Response
 
 try:
     from ..auth_utils import get_current_user, require_admin
+    from ..config import TODO_OIDC_CALLBACK_ROUTE_PATH
     from ..models.auth import (
         LiveKitTokenRequest,
         ServiceApplicationRequest,
-        SessionLoginRequest,
+        SessionOidcStartRequest,
     )
     from ..services.livekit import issue_livekit_token
     from ..services.session_auth import get_session_service
 except ImportError:  # pragma: no cover
     from auth_utils import get_current_user, require_admin
-    from models.auth import LiveKitTokenRequest, ServiceApplicationRequest, SessionLoginRequest
+    from config import TODO_OIDC_CALLBACK_ROUTE_PATH
+    from models.auth import (
+        LiveKitTokenRequest,
+        ServiceApplicationRequest,
+        SessionOidcStartRequest,
+    )
     from services.livekit import issue_livekit_token
     from services.session_auth import get_session_service
 
@@ -19,10 +25,25 @@ except ImportError:  # pragma: no cover
 router = APIRouter(prefix="/api", tags=["auth"])
 
 
-@router.post("/session/login")
-async def session_login(data: SessionLoginRequest, response: Response):
-    """중앙 auth-api를 사용해 todo 세션을 생성한다."""
-    return await get_session_service().login(data.loginId, data.password, response)
+@router.post("/session/oidc/start")
+async def session_oidc_start(body: SessionOidcStartRequest | None = None):
+    """todo-web 용 OIDC authorize URL 을 생성한다."""
+    return await get_session_service().start_login(body.returnTo if body else None)
+
+
+async def session_oidc_callback(
+    code: str | None = Query(default=None),
+    state: str | None = Query(default=None),
+    error: str | None = Query(default=None),
+    error_description: str | None = Query(default=None),
+):
+    """auth-api callback code 를 todo 세션으로 교환하고 todo-web 로 redirect 한다."""
+    return await get_session_service().handle_oidc_callback(
+        code=code,
+        state=state,
+        error=error,
+        error_description=error_description,
+    )
 
 
 @router.post("/session/logout")
@@ -63,3 +84,10 @@ async def get_livekit_token(
 ):
     """프로젝트 room 참여용 LiveKit 토큰을 발급한다."""
     return issue_livekit_token(body.roomName, user)
+
+
+router.add_api_route(
+    TODO_OIDC_CALLBACK_ROUTE_PATH,
+    session_oidc_callback,
+    methods=["GET"],
+)
