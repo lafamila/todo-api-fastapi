@@ -4,6 +4,11 @@ FastAPI backend for todo/project/memo/daily-task/article data. Raw SQL via PyMyS
 
 > 이 파일이 본 레포의 canonical 가이드입니다. `AGENTS.md` 는 codex 호환용 stub 입니다.
 
+- **Lifecycle**: DEPLOY
+- **Status**: active
+- **Port**: 8000
+- **Auth**: `auth-api-nest-oidc-session` (중앙 OIDC 로그인 — 세션 쿠키/opaque 세션은 이 API 가 소유)
+
 ## 워크스페이스 대원칙 (canonical)
 
 이 레포는 `../CLAUDE.md` 의 **DEVELOPMENT PRINCIPLES** 섹션을 따른다. 핵심 재진술:
@@ -28,14 +33,20 @@ FastAPI backend for todo/project/memo/daily-task/article data. Raw SQL via PyMyS
 
 ```
 src/
-├── __main__.py           # FastAPI app setup and router registration
-├── __init__.py           # Empty
-└── connectors/
-    └── __init__.py       # DB config, get_db_connection() context manager, init_db() DDL
+├── __main__.py           # FastAPI app 생성(lifespan), CORS, 라우터 등록, Socket.IO ASGI wrap
+├── config.py             # .env 로딩 — DB_*, AUTH_*, TODO_*, LIVEKIT_* 설정값
+├── auth_utils.py         # 토큰/권한 유틸
+├── token_verifier.py     # auth-api-nest JWKS 검증
+├── utils.py
+├── connectors/
+│   └── __init__.py       # DB config, get_db_connection() context manager, init_db() DDL
+├── models/               # Pydantic 모델 (auth, base, daily_tasks)
+├── routers/              # APIRouter 모듈 — auth, projects, memos, articles, daily_tasks
+└── services/             # session_auth(OIDC 세션), realtime(Socket.IO), livekit(토큰 발급)
 scripts/
 └── export_topic_data.py  # Read-only legacy topic export for topic-api-fastapi migration
-Dockerfile                # Python 3.11-slim, port 8000
-requirements.txt          # fastapi 0.115.5, uvicorn, pymysql, pydantic 2, python-dotenv
+Dockerfile                # Python 3.11-slim, port 8000, HEALTHCHECK 포함
+requirements.txt          # fastapi 0.115.5, uvicorn, pymysql, pydantic 2, python-dotenv 등
 ```
 
 Topic collection/insight data and embedding similarity search moved to `../topic-api-fastapi`.
@@ -45,7 +56,7 @@ This repo keeps only a read-only legacy export script until migration verificati
 
 | Task | Location | Notes |
 |------|----------|-------|
-| Add API endpoint | `src/__main__.py` | Add route function + Pydantic request model in same file |
+| Add API endpoint | `src/routers/{domain}.py` | 라우터 모듈에 route + Pydantic request model 추가, `__main__.py` 에 등록 |
 | Change DB schema | `src/connectors/__init__.py` `init_db()` | DDL in raw SQL, auto-runs on startup |
 | DB connection | `src/connectors/__init__.py` `get_db_connection()` | Context manager with auto-commit/rollback |
 | Environment vars | `.env` / `.env.example` → `DB_*`, `AUTH_*`, `TODO_*`, `LIVEKIT_*` | Loaded via `python-dotenv`; deploy 시 런타임 env 주입 |
@@ -53,14 +64,20 @@ This repo keeps only a read-only legacy export script until migration verificati
 
 ## DATABASE SCHEMA
 
-```sql
-projects (id PK, name, icon, is_secret, password, created_at, updated_at)
-memos (id PK, project_id FK→projects, title, content LONGTEXT, created_at, updated_at)
-memo_versions (id PK, memo_id FK→memos, content LONGTEXT, version INT, created_at)
+`src/connectors/__init__.py` `init_db()` 의 DDL 이 canonical 이다. 현재 7개 테이블:
+
+```text
+projects               (id PK, name, icon, status, is_secret, password[legacy], created_at, updated_at)
+memos                  (id PK, project_id FK→projects, title, content LONGTEXT, status, deleted_at, ...)
+memo_versions          (id PK, memo_id FK→memos, content LONGTEXT, version INT, created_at)
+articles               (id PK, memo_id FK→memos UNIQUE, project_id FK→projects, author_id, author_slug, title, content, published_version, ...)
+project_members        (id PK, project_id FK→projects, user_id, username, display_name, email, role, invited_at; UNIQUE(project_id,user_id))
+daily_task_types       (id PK, name UNIQUE, icon, color, display_order, is_active, ...)
+daily_task_completions (id PK, task_type_id FK→daily_task_types, completed_date DATE, total_active_count; UNIQUE(task_type_id,completed_date))
 ```
 
 - `VARCHAR(50)` UUIDs as primary keys (generated via `uuid.uuid4()`)
-- Cascading deletes: project → memos → memo_versions
+- Cascading deletes: project → memos → memo_versions / articles / project_members, daily_task_types → daily_task_completions
 - InnoDB, utf8mb4
 
 ## TODO AUTHZ CONTRACT
@@ -94,7 +111,7 @@ memo_versions (id PK, memo_id FK→memos, content LONGTEXT, version INT, created
 
 ## CONVENTIONS
 
-- **Single file API** — all routes in `__main__.py` (no router splitting)
+- **Router 분할** — 라우트는 `src/routers/{domain}.py` 의 `APIRouter` 로 나뉘고 `__main__.py` 에서 등록한다 (과거 single-file 패턴은 폐기됨)
 - **snake_case DB columns** → **camelCase JSON responses** (manual dict mapping in each route)
 - **Pydantic models**: `Create{Entity}Request`, `Verify{Action}Request` for inputs; `Project`, `Memo` for response shapes
 - **Context manager** for DB: `with get_db_connection() as conn:` (auto-commit on success, rollback on error)
@@ -105,21 +122,21 @@ memo_versions (id PK, memo_id FK→memos, content LONGTEXT, version INT, created
 ## ANTI-PATTERNS
 
 - **Project password is legacy** — 중앙 auth 전환 후 제거 대상.
-- **`@app.on_event("startup")`** is deprecated — should migrate to `lifespan` context manager
+- ~~`@app.on_event("startup")`~~ — **해결됨**: `lifespan` context manager 로 전환 완료. 새 코드에서 `on_event` 재도입 금지.
 - **No input sanitization** on f-string in `init_db()`: `f"CREATE DATABASE IF NOT EXISTS {DB_CONFIG['database']}"` (SQL injection risk if DB_NAME is user-controlled)
 - **Memo versioning** saves old content before update but **no version diffing** — stores full content copies
 - **No pagination** on any list endpoint
 
 ## API ENDPOINTS
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/projects` | List all projects (excludes password) |
-| POST | `/api/projects` | Create project |
-| POST | `/api/projects/{id}/verify` | Verify project password |
-| GET | `/api/projects/{id}/memos` | List project's memos |
-| POST | `/api/memos` | Create memo |
-| GET | `/api/memos/{id}` | Get memo detail |
-| PUT | `/api/memos/{id}` | Update memo (saves version history) |
-| GET | `/api/memos/{id}/versions` | List memo versions |
-| GET | `/api/memos/{id}/versions/{v}` | Get specific version |
+`src/routers/` 의 라우트 정의가 canonical 이다 (총 34개, 전부 `/api/*`). 카테고리 요약:
+
+| Category | Router | Routes |
+|----------|--------|--------|
+| Auth/session | `routers/auth.py` | `POST /api/session/oidc/start`, `POST /api/session/logout`, `GET /api/session/me`, `POST /api/session/service-application`, `GET /api/users/search`, `POST /api/livekit/token` |
+| Projects | `routers/projects.py` | `GET/POST /api/projects`, `POST /api/projects/{id}/verify`, 멤버 관리 `GET/POST /api/projects/{id}/members`, `DELETE /api/projects/{id}/members/{userId}` |
+| Memos | `routers/memos.py` | `GET /api/projects/{id}/memos`, `POST /api/memos`, `GET/PUT/DELETE /api/memos/{id}`, `POST /api/memos/bulk-delete`, 버전 `GET /api/memos/{id}/versions[/{v}]` |
+| Articles | `routers/articles.py` | `POST/GET /api/articles`, `GET /api/articles/boards/{slug}`, `GET/DELETE /api/articles/{id}`, `GET /api/memos/{id}/article` |
+| Daily tasks | `routers/daily_tasks.py` | `/api/daily-tasks` prefix — `POST/GET/PUT/DELETE .../types[/{id}]`, `POST .../complete`, `DELETE .../complete/{typeId}/{date}`, `GET .../calendar[/{date}]` |
+
+Socket.IO realtime 서버(`services/realtime.py`)가 FastAPI app 을 ASGI wrap 한다. 전용 health 엔드포인트는 없다 (Docker HEALTHCHECK 는 `GET /docs` 사용).
