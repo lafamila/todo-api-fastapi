@@ -37,6 +37,20 @@
     --dry-run  : 대상에 SQL 을 실제 실행해 제약 위반까지 검증한 뒤 커밋 대신 롤백.
     --replace  : 대상 todo 테이블(articles/memo_versions/memos/project_members/projects)을
                  비우고 적재. 반드시 --confirm-replace <target database 이름> 을 함께 요구한다.
+
+모드 (--mode):
+    legacy (기본) : 소스 = 레거시 스키마(project/task/detail). 위 매핑으로 변환 적재.
+    mirror        : 소스 = 이 레포 스키마의 DB (예: 로컬 teddynote). projects/project_members/
+                    memos/memo_versions/articles 를 id 그대로 복사(upsert)한다. 컬럼은
+                    소스∩대상 교집합만 사용해 스키마 드리프트(owner_id 등)에 안전하다.
+
+사용 예 (prod 를 현재 로컬 데이터로 전체 교체 — "지우고 이 데이터로만"):
+    python scripts/migrate_legacy_todo.py --mode mirror \
+        --source-host 127.0.0.1 --source-port 33306 --source-user root \
+        --source-password '...' --source-database teddynote \
+        --target-host <prod-host> --target-port 3306 --target-user <user> \
+        --target-password '...' --target-database <prod-db> \
+        --replace --confirm-replace <prod-db>
 """
 
 from __future__ import annotations
@@ -60,9 +74,9 @@ UNTITLED = "(제목 없음)"
 DEFAULT_ICON = "Beer"  # 신규 앱 AllIcons 기본값 — 소스 icon 이 비어있을 때만 사용
 ICON_MAX_LEN = 10  # projects.icon VARCHAR(10)
 
-# 단일 사용자 서비스의 owner 기본 identity — env 또는 CLI 로 덮어쓸 수 있다.
-# (기본 id 는 현행 auth 계정 — 과거 스크립트의 89ef19ed-... 는 구 auth DB 시절 값이라 폐기)
-DEFAULT_OWNER_ID = os.getenv("TODO_MIGRATION_OWNER_ID", "e1ecab2f-32ed-4590-81bd-e9975cf3667f")
+# owner 계정 id 는 반드시 명시한다 (--owner-user-id 또는 TODO_MIGRATION_OWNER_ID env).
+# 하드코딩 기본값은 두지 않는다 — 과거 스크립트의 89ef19ed-... 처럼 낡은 값이 조용히 쓰이는 사고 방지.
+DEFAULT_OWNER_ID = os.getenv("TODO_MIGRATION_OWNER_ID")
 DEFAULT_OWNER_LOGIN = os.getenv("TODO_MIGRATION_OWNER_LOGIN", "lafamila")
 DEFAULT_OWNER_NAME = os.getenv("TODO_MIGRATION_OWNER_NAME", "lafamila")
 DEFAULT_OWNER_EMAIL = os.getenv("TODO_MIGRATION_OWNER_EMAIL", "lafamila325@gmail.com")
@@ -93,6 +107,12 @@ def parse_args() -> argparse.Namespace:
     owner.add_argument("--owner-display-name", default=DEFAULT_OWNER_NAME)
     owner.add_argument("--owner-email", default=DEFAULT_OWNER_EMAIL)
 
+    parser.add_argument(
+        "--mode",
+        choices=("legacy", "mirror"),
+        default="legacy",
+        help="legacy: 레거시 스키마 변환 적재 / mirror: 현행 스키마 DB 를 그대로 복사",
+    )
     parser.add_argument("--dry-run", action="store_true", help="SQL 실행 후 커밋 대신 롤백")
     parser.add_argument(
         "--replace",
@@ -111,6 +131,11 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--replace 는 파괴적입니다. --confirm-replace "
             f"'{args.target_database}' 를 함께 지정해야 실행됩니다."
+        )
+    if args.mode == "legacy" and not args.owner_user_id:
+        parser.error(
+            "legacy 모드에는 --owner-user-id (또는 TODO_MIGRATION_OWNER_ID env) 가 필요합니다. "
+            "마이그레이션된 프로젝트의 소유자/멤버십 계정 id 입니다."
         )
     return args
 
@@ -159,9 +184,10 @@ def load_source(conn):
     return projects, tasks, details
 
 
-def table_columns(cursor, table: str) -> set[str]:
+def table_columns(cursor, table: str) -> list[str]:
+    """테이블 컬럼 이름 목록 (정의 순서 유지)."""
     cursor.execute(f"SHOW COLUMNS FROM `{table}`")
-    return {row["Field"] for row in cursor.fetchall()}
+    return [row["Field"] for row in cursor.fetchall()]
 
 
 def ensure_status_columns(cursor) -> None:
@@ -193,7 +219,73 @@ def upsert(cursor, table: str, columns: list[str], values: list, update_columns:
     )
 
 
+# mirror 모드에서 복사하는 프로젝트 계열 테이블 — FK 삽입 순서 그대로.
+MIRROR_TABLES = ("projects", "project_members", "memos", "memo_versions", "articles")
+
+
+def migrate_mirror(args: argparse.Namespace) -> int:
+    """현행 스키마 DB(예: 로컬 teddynote)를 대상 DB 로 그대로 복사(upsert)한다.
+
+    컬럼은 소스∩대상 교집합만 사용 — owner_id/created_by 같은 드리프트 컬럼이
+    한쪽에만 있어도 안전하다. --replace 와 함께 쓰면 대상을 소스와 동일하게 만든다.
+    """
+    source = connect(
+        args.source_host, args.source_port, args.source_user, args.source_password, args.source_database
+    )
+    rows_by_table: dict[str, tuple[list[str], list[dict]]] = {}
+    with source.cursor() as cursor:
+        for table in MIRROR_TABLES:
+            columns = table_columns(cursor, table)
+            cursor.execute(f"SELECT * FROM `{table}`")
+            rows_by_table[table] = (columns, cursor.fetchall())
+    source.close()
+    print("source:", " ".join(f"{t}={len(rows_by_table[t][1])}" for t in MIRROR_TABLES))
+
+    target = connect(
+        args.target_host, args.target_port, args.target_user, args.target_password, args.target_database
+    )
+    stats = defaultdict(int)
+    try:
+        with target.cursor() as cursor:
+            ensure_status_columns(cursor)
+            if args.replace:
+                clear_target(cursor)
+                print("[replace] 대상 todo 테이블을 비웠습니다.")
+            for table in MIRROR_TABLES:
+                source_columns, rows = rows_by_table[table]
+                target_columns = table_columns(cursor, table)
+                columns = [c for c in source_columns if c in target_columns]
+                skipped = [c for c in source_columns if c not in target_columns]
+                if skipped:
+                    print(f"  {table}: 대상에 없는 컬럼 제외 — {skipped}")
+                update_columns = [c for c in columns if c != "id"]
+                for row in rows:
+                    upsert(cursor, table, columns, [row[c] for c in columns], update_columns)
+                    stats[table] += 1
+
+        if args.dry_run:
+            target.rollback()
+            print("[dry-run] 모든 SQL 실행 후 롤백했습니다 (대상 무변경).")
+        else:
+            target.commit()
+            print("커밋 완료.")
+    except Exception:
+        target.rollback()
+        raise
+    finally:
+        target.close()
+
+    print("upserted:", " ".join(f"{t}={stats[t]}" for t in MIRROR_TABLES))
+    return 0
+
+
 def migrate(args: argparse.Namespace) -> int:
+    if args.mode == "mirror":
+        return migrate_mirror(args)
+    return migrate_legacy(args)
+
+
+def migrate_legacy(args: argparse.Namespace) -> int:
     source = connect(
         args.source_host, args.source_port, args.source_user, args.source_password, args.source_database
     )
