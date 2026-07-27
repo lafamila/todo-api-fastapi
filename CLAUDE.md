@@ -44,7 +44,8 @@ src/
 ├── routers/              # APIRouter 모듈 — auth, projects, memos, articles, daily_tasks
 └── services/             # session_auth(OIDC 세션), realtime(Socket.IO), livekit(토큰 발급)
 scripts/
-└── export_topic_data.py  # Read-only legacy topic export for topic-api-fastapi migration
+├── export_topic_data.py  # Read-only legacy topic export for topic-api-fastapi migration
+└── migrate_legacy_todo.py # 레거시 todo DB(:3030 스택) → 이 스키마 마이그레이션 (additive upsert, 접속정보 CLI 파라미터)
 Dockerfile                # Python 3.11-slim, port 8000, HEALTHCHECK 포함
 requirements.txt          # fastapi 0.115.5, uvicorn, pymysql, pydantic 2, python-dotenv 등
 ```
@@ -76,6 +77,11 @@ daily_task_types       (id PK, name UNIQUE, icon, color, display_order, is_activ
 daily_task_completions (id PK, task_type_id FK→daily_task_types, completed_date DATE, total_active_count; UNIQUE(task_type_id,completed_date))
 ```
 
+- **스키마 드리프트 주의**: 운영/로컬 실DB 에는 `projects.owner_id`, `memos.created_by` 컬럼이 존재하지만
+  `init_db()` DDL 에는 없다 (과거 ALTER 산물). 마이그레이션 스크립트는 이를 런타임에 감지해 대응한다.
+- 레거시 todo(:3030) 데이터 이관: `scripts/migrate_legacy_todo.py` — additive/idempotent upsert
+  (`legacy-*` 결정적 id), `--replace` 는 `--confirm-replace <db>` 필수, 대상 접속정보는 CLI 파라미터로
+  원격(prod) DB 지정 가능. detail 히스토리는 `memo_versions` 로 보존된다.
 - `VARCHAR(50)` UUIDs as primary keys (generated via `uuid.uuid4()`)
 - Cascading deletes: project → memos → memo_versions / articles / project_members, daily_task_types → daily_task_completions
 - InnoDB, utf8mb4
