@@ -119,6 +119,97 @@ class TodoSessionServiceOidcTests(unittest.IsolatedAsyncioTestCase):
             session_auth.TODO_WEB_DEFAULT_RETURN_PATH,
         )
 
+    async def test_create_service_application_requests_user_permission(self) -> None:
+        request = object()
+        session = session_auth.TodoSession(
+            id="todo-session-123",
+            access_token="access-token",
+            refresh_token="refresh-token",
+            access_token_expires_at=9999999999,
+            user={"id": "user-1", "permission": "visitor"},
+        )
+        calls = []
+
+        async def fake_require_valid_session(request_value):
+            self.assertIs(request_value, request)
+            return session
+
+        def fake_request_json(method, url, body, headers, allowed_error_statuses):
+            calls.append((method, url, body, headers, allowed_error_statuses))
+            return session_auth._HttpResponse(
+                status=201,
+                headers={},
+                data={"id": "application-1"},
+            )
+
+        self.service.require_valid_session = fake_require_valid_session  # type: ignore[method-assign]
+        self.service._request_json = fake_request_json  # type: ignore[method-assign]
+
+        response = await self.service.create_service_application(
+            request,  # type: ignore[arg-type]
+            "  Please grant access  ",
+        )
+
+        self.assertEqual(response, {"id": "application-1"})
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "POST",
+                    "http://auth.example/api/service-applications",
+                    {
+                        "serviceKey": "todo",
+                        "message": "Please grant access",
+                        "requestedPermissionKey": "user",
+                    },
+                    {"Authorization": "Bearer access-token"},
+                    None,
+                )
+            ],
+        )
+
+    async def test_create_service_application_uses_default_for_blank_message(
+        self,
+    ) -> None:
+        request = object()
+        session = session_auth.TodoSession(
+            id="todo-session-123",
+            access_token="access-token",
+            refresh_token="refresh-token",
+            access_token_expires_at=9999999999,
+            user={"id": "user-1", "permission": "visitor"},
+        )
+        payloads = []
+
+        async def fake_require_valid_session(_request):
+            return session
+
+        def fake_request_json(_method, _url, body, _headers, _allowed_error_statuses):
+            payloads.append(body)
+            return session_auth._HttpResponse(status=201, headers={}, data={})
+
+        self.service.require_valid_session = fake_require_valid_session  # type: ignore[method-assign]
+        self.service._request_json = fake_request_json  # type: ignore[method-assign]
+
+        for message in ("", " \t\n ", None):
+            with self.subTest(message=message):
+                await self.service.create_service_application(
+                    request,  # type: ignore[arg-type]
+                    message,
+                )
+
+        self.assertEqual(
+            payloads,
+            [
+                {
+                    "serviceKey": "todo",
+                    "message": "todo 서비스를 사용하기 위해 user 권한 상승을 요청합니다.",
+                    "requestedPermissionKey": "user",
+                }
+            ]
+            * 3,
+        )
+
 
 class TodoTokenVerifierTests(unittest.TestCase):
     def test_builds_superadmin_user_from_auth_service_claim(self) -> None:

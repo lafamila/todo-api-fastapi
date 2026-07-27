@@ -156,11 +156,20 @@ class TodoSessionService:
 
     async def create_service_application(self, request: Request, message: str | None) -> Any:
         session = await self.require_valid_session(request)
+        request_message = (
+            message.strip()
+            if isinstance(message, str) and message.strip()
+            else "todo 서비스를 사용하기 위해 user 권한 상승을 요청합니다."
+        )
         response = await asyncio.to_thread(
             self._request_json,
             "POST",
             f"{self.auth_api_base_url}/api/service-applications",
-            {"serviceKey": "todo", "message": message or ""},
+            {
+                "serviceKey": "todo",
+                "message": request_message,
+                "requestedPermissionKey": "user",
+            },
             {
                 "Authorization": f"Bearer {session.access_token}",
             },
