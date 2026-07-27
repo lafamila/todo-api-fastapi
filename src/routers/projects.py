@@ -171,7 +171,7 @@ async def get_projects(user: dict = Depends(get_current_user)):
                     """
                     SELECT DISTINCT p.id, p.name, p.icon, p.status, p.is_secret, p.owner_id, p.created_at, p.updated_at
                     FROM projects p
-                    ORDER BY p.created_at DESC
+                    ORDER BY p.created_at ASC
                 """
                 )
             elif user["is_admin"]:
@@ -181,7 +181,7 @@ async def get_projects(user: dict = Depends(get_current_user)):
                     FROM projects p
                     LEFT JOIN project_members pm ON p.id = pm.project_id AND pm.user_id = %s
                     WHERE p.owner_id = %s OR pm.user_id = %s
-                    ORDER BY p.created_at DESC
+                    ORDER BY p.created_at ASC
                 """,
                     (user["id"], user["id"], user["id"]),
                 )
@@ -192,7 +192,7 @@ async def get_projects(user: dict = Depends(get_current_user)):
                     FROM projects p
                     JOIN project_members pm ON p.id = pm.project_id
                     WHERE pm.user_id = %s
-                    ORDER BY p.created_at DESC
+                    ORDER BY p.created_at ASC
                 """,
                     (user["id"],),
                 )
