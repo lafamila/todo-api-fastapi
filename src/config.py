@@ -119,6 +119,11 @@ SYNC_ACCOUNT_ID = os.getenv("SYNC_ACCOUNT_ID", "").strip()
 # 127.0.0.1 바인딩을 전제로 한 선택이므로 노트북 스택에서만 켠다.
 TODO_LOCAL_SESSION_ENABLED = _get_bool("TODO_LOCAL_SESSION_ENABLED", False)
 
+# 세션 DB 영속화 — 프로세스 재시작(코드 리로드·재부팅)을 넘어 세션이 유지된다.
+# 기본 false: prod(배포본)는 인메모리 유지가 보수적이라 무변경 — 테이블 생성 DDL 도
+# 이 플래그 뒤에 있어 prod DB 에는 테이블조차 생기지 않는다. 노트북 스택에서만 켠다.
+TODO_SESSION_DB_PERSISTENCE = _get_bool("TODO_SESSION_DB_PERSISTENCE", False)
+
 SYNC_BACKUP_DIR = os.getenv("SYNC_BACKUP_DIR", "../.backups/db")
 
 

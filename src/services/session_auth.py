@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import ipaddress
 import json
+import logging
 from dataclasses import dataclass, field
 from http.cookies import SimpleCookie
 from threading import RLock
@@ -32,6 +34,7 @@ try:
         AUTH_ISSUER_URL,
         SYNC_ACCOUNT_ID,
         TODO_LOCAL_SESSION_ENABLED,
+        TODO_SESSION_DB_PERSISTENCE,
         runs_sync_daemon,
     )
     from ..connectors import get_db_connection
@@ -58,6 +61,7 @@ except ImportError:  # pragma: no cover
         AUTH_ISSUER_URL,
         SYNC_ACCOUNT_ID,
         TODO_LOCAL_SESSION_ENABLED,
+        TODO_SESSION_DB_PERSISTENCE,
         runs_sync_daemon,
     )
     from connectors import get_db_connection
@@ -131,6 +135,41 @@ class TodoSession:
     # 만료로 인한 보호를 포기하는 대가로 오프라인 무기한 동작을 얻는다.
     # 전제: 로컬 API 는 loopback에 게시되고 sync client 역할에서만 허용한다.
     offline: bool = False
+
+
+logger = logging.getLogger("uvicorn.error")
+
+
+def _session_id_hash(session_id: str) -> str:
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+
+
+def _serialize_session(session: TodoSession) -> str:
+    # float("inf") 는 python json 기본 동작으로 'Infinity' 왕복이 된다 (오프라인 무기한 세션).
+    return json.dumps(
+        {
+            "id": session.id,
+            "accessToken": session.access_token,
+            "refreshToken": session.refresh_token,
+            "accessTokenExpiresAt": session.access_token_expires_at,
+            "user": session.user,
+            "issuer": session.issuer,
+            "offline": session.offline,
+        }
+    )
+
+
+def _deserialize_session(payload: str) -> TodoSession:
+    data = json.loads(payload)
+    return TodoSession(
+        id=data["id"],
+        access_token=data.get("accessToken", ""),
+        refresh_token=data.get("refreshToken", ""),
+        access_token_expires_at=float(data.get("accessTokenExpiresAt", 0.0)),
+        user=data.get("user") or {},
+        issuer=data.get("issuer"),
+        offline=bool(data.get("offline")),
+    )
 
 
 @dataclass
@@ -664,6 +703,8 @@ class TodoSessionService:
                     )
                     if replace_session:
                         self._sessions[session_id] = updated
+                if replace_session:
+                    self._persist_session(updated)
                 if not replace_session:
                     self._revoke_refresh_token_safe(updated.refresh_token)
                     raise HTTPException(
@@ -742,25 +783,91 @@ class TodoSessionService:
                 offline=True,
             )
             self._sessions[session_id] = offline_session
+        self._persist_session(offline_session)
         return offline_session
 
     def _get_request_session(self, request_obj: Request) -> TodoSession | None:
         session_id = request_obj.cookies.get(self.cookie_name)
         return self._get_session_by_id(session_id)
 
+    # -- 세션 DB 영속화 (로컬 opt-in) ------------------------------------
+    # 실패가 로그인 경로를 막으면 안 되므로 모든 DB 접근은 경고 로그로 흡수한다.
+
+    def _persist_session(self, session: TodoSession) -> None:
+        if not TODO_SESSION_DB_PERSISTENCE:
+            return
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO todo_sessions (id_hash, payload, updated_at_utc)
+                        VALUES (%s, %s, UTC_TIMESTAMP(3))
+                        ON DUPLICATE KEY UPDATE payload = VALUES(payload),
+                                                updated_at_utc = VALUES(updated_at_utc)
+                        """,
+                        (_session_id_hash(session.id), _serialize_session(session)),
+                    )
+        except Exception:  # noqa: BLE001
+            logger.warning("session persistence write failed", exc_info=True)
+
+    def _erase_persisted_session(self, session_id: str) -> None:
+        if not TODO_SESSION_DB_PERSISTENCE:
+            return
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "DELETE FROM todo_sessions WHERE id_hash = %s",
+                        (_session_id_hash(session_id),),
+                    )
+        except Exception:  # noqa: BLE001
+            logger.warning("session persistence delete failed", exc_info=True)
+
+    def _load_persisted_session(self, session_id: str) -> TodoSession | None:
+        if not TODO_SESSION_DB_PERSISTENCE:
+            return None
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT payload FROM todo_sessions WHERE id_hash = %s",
+                        (_session_id_hash(session_id),),
+                    )
+                    row = cursor.fetchone()
+            if not row:
+                return None
+            return _deserialize_session(row["payload"])
+        except Exception:  # noqa: BLE001
+            logger.warning("session persistence read failed", exc_info=True)
+            return None
+
     def _get_session_by_id(self, session_id: str | None) -> TodoSession | None:
         if not session_id:
             return None
         with self._lock:
-            return self._sessions.get(session_id)
+            session = self._sessions.get(session_id)
+        if session is not None:
+            return session
+        # 프로세스 재시작(리로드·재부팅) 뒤에는 메모리에 없다 — DB 에서 복원한다.
+        restored = self._load_persisted_session(session_id)
+        if restored is None:
+            return None
+        with self._lock:
+            # 동시 복원 경합은 먼저 들어간 쪽을 쓴다.
+            session = self._sessions.setdefault(session_id, restored)
+        return session
 
     def _store_session(self, session: TodoSession) -> None:
         with self._lock:
             self._sessions[session.id] = session
+        self._persist_session(session)
 
     def _delete_session(self, session_id: str) -> None:
         with self._lock:
             deleted = self._sessions.pop(session_id, None)
+        # 메모리에 없어도(재시작 직후 로그아웃) 영속 행은 지워야 한다.
+        self._erase_persisted_session(session_id)
         if deleted is not None:
             self._notify_session_invalidated(session_id)
 
@@ -772,6 +879,7 @@ class TodoSessionService:
             if current is None or current.refresh_token != refresh_token:
                 return
             self._sessions.pop(session_id, None)
+        self._erase_persisted_session(session_id)
         self._notify_session_invalidated(session_id)
 
     def _notify_session_invalidated(self, session_id: str) -> None:

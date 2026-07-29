@@ -60,6 +60,22 @@ def change_log_enabled(cursor):
             cursor.execute(SYNC_APPLYING_SQL)
 
 
+def ensure_session_table(cursor) -> None:
+    """세션 영속화 테이블 — **노드 로컬** 이다 (동기화 화이트리스트·트리거 대상 아님).
+
+    `TODO_SESSION_DB_PERSISTENCE` 가 켜진 스택(노트북)에서만 생성/사용된다.
+    """
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS todo_sessions (
+            id_hash CHAR(64) PRIMARY KEY,
+            payload LONGTEXT NOT NULL,
+            updated_at_utc DATETIME(3) NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """
+    )
+
+
 def init_db():
     """데이터베이스 초기화 - 테이블 생성"""
     connection = pymysql.connect(
@@ -298,6 +314,10 @@ def init_db():
             # ============ 동기화 스키마 (root plan: TODO OFFLINE SYNC) ============
 
             _init_sync_schema(cursor)
+
+            # 세션 DB 영속화는 로컬(노트북) 전용 opt-in — 기본값(prod)에서는 테이블도 만들지 않는다.
+            if os.getenv("TODO_SESSION_DB_PERSISTENCE", "").strip().lower() in {"1", "true", "yes", "on"}:
+                ensure_session_table(cursor)
 
             connection.commit()
             print("Database initialized successfully")

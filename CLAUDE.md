@@ -273,6 +273,14 @@ body {"keyId","secret","requiredScope":"sync"}
 502 이상이면 오프라인 세션으로 이어붙인다. `TODO_LOCAL_SESSION_ENABLED=true` + **loopback 요청만**
 허용한다. 만료로 인한 보호를 포기하는 선택이므로 로컬 API 는 반드시 `127.0.0.1` 바인딩을 유지해야 한다.
 
+**세션 DB 영속화 (`TODO_SESSION_DB_PERSISTENCE`, 기본 false)** — 세션은 원래 인메모리라
+프로세스 재시작(코드 리로드·재부팅)마다 사라진다. 이 플래그를 켜면 `todo_sessions` 테이블에
+write-through 로 저장하고 조회 미스 시 복원해 "한번 로그인, 무기한 유지"가 재시작을 넘어 성립한다.
+기본 off 는 prod 무변경을 위한 것 — **테이블 생성 DDL 도 플래그 뒤에 있어** prod DB 에는 테이블조차
+생기지 않는다 (refresh token 을 NAS 에 영속화하지 않는 보수적 상태 유지). 노트북 스택만 compose 로 켠다.
+`todo_sessions` 는 **노드 로컬**이다 — 동기화 화이트리스트·트리거 대상이 아니며, id 는 sha256 해시로
+저장한다. 영속화 실패는 경고 로그로 흡수되어 로그인 경로를 막지 않는다.
+
 ### CLI
 
 ```bash
