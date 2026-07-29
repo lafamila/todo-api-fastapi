@@ -133,6 +133,22 @@ def sync_role() -> str:
         return SYNC_ROLE_DISABLED
     return SYNC_ROLE_CLIENT if SYNC_PEER_URL else SYNC_ROLE_SERVER
 
+def feature_flags() -> dict:
+    """스택 성격에 따라 웹에서 숨길 prod 전용 표면 (`/api/session/me` 로 내려간다).
+
+    로컬 실사용(sync client) 스택은 단일 사용자 오프라인 복제본이다:
+    - articles 게시: articles 는 동기화 제외 테이블 — 로컬에서 게시하면 로컬 DB 에만 남는다
+    - 화면공유(LiveKit)·멤버 초대: 멀티유저 기능이라 무의미하다
+    dev 스택(disabled)은 기능을 테스트하는 곳이므로 전부 노출한다. prod(server)도 전부 노출.
+    """
+    local_client = sync_role() == "client"
+    return {
+        "screenShare": not local_client,
+        "articles": not local_client,
+        "memberInvite": not local_client,
+    }
+
+
 
 def serves_sync_peer_api() -> bool:
     """`/api/sync/{handshake,changes,push,locks}` 를 서빙하는가 (서버 역할)."""

@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, Query, Request, Response
 
 try:
     from ..auth_utils import get_current_user, require_admin
-    from ..config import TODO_OIDC_CALLBACK_ROUTE_PATH
+    from ..config import feature_flags, TODO_OIDC_CALLBACK_ROUTE_PATH
     from ..models.auth import (
         LiveKitTokenRequest,
         ServiceApplicationRequest,
@@ -12,7 +12,7 @@ try:
     from ..services.session_auth import get_session_service
 except ImportError:  # pragma: no cover
     from auth_utils import get_current_user, require_admin
-    from config import TODO_OIDC_CALLBACK_ROUTE_PATH
+    from config import feature_flags, TODO_OIDC_CALLBACK_ROUTE_PATH
     from models.auth import (
         LiveKitTokenRequest,
         ServiceApplicationRequest,
@@ -55,8 +55,12 @@ async def session_logout(request: Request, response: Response):
 
 @router.get("/session/me")
 async def session_me(request: Request):
-    """현재 todo 세션 사용자를 반환한다 (오프라인 세션이면 `offline: true`)."""
-    return await get_session_service().get_user(request)
+    """현재 todo 세션 사용자를 반환한다 (오프라인 세션이면 `offline: true`).
+
+    `features` 는 스택 성격(sync 역할)에 따라 웹이 숨길 prod 전용 표면 목록이다.
+    """
+    me = await get_session_service().get_user(request)
+    return {**me, "features": feature_flags()}
 
 
 @router.post("/session/local")
