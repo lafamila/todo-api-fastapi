@@ -129,6 +129,8 @@ celerybeat.pid
 
 # Environments
 .env
+# 실사용 로컬 스택 비밀 오버라이드 (compose env_file 2번째) — 절대 커밋 금지
+.env.sync-client
 .venv
 env/
 venv/
