@@ -9,7 +9,7 @@
 매핑:
     project        → projects        (id = legacy-project-{id}, icon 은 동일 SVG 이름 어휘라 그대로)
     task           → memos           (id = legacy-memo-{id}, status = task_status 그대로)
-    detail 최신본   → memos.content   (updated_at = 해당 detail 의 reg_dtm)
+    detail 최신본   → memos.content   (updated_at 은 task 생성시간과 동일하게 저장)
     detail 과거본   → memo_versions   (version 1..N-1 — 서버의 MAX(version)+1 증가와 정합)
     프로젝트별 owner → project_members (role='owner' — 신규 서비스의 프로젝트 가시성은 멤버십 기반)
 
@@ -20,7 +20,8 @@
     - `--replace` 를 명시한 경우에만 대상 todo 테이블을 비우고 새로 적재한다 (확인 문자열 필요).
     - 대상 스키마 드리프트 자동 감지: 실DB 에 `projects.owner_id` / `memos.created_by` 가
       있으면 채우고(현 로컬 DB), 없으면(순정 init_db 스키마) 해당 컬럼 없이 INSERT 한다.
-    - 날짜/시간: 소스·대상 모두 Asia/Seoul naive DATETIME — 변환 없이 그대로 옮긴다 (원칙 8).
+    - 날짜/시간: 생성시간은 변환 없이 옮기고, 레거시 데이터의 마지막 편집시간은 알 수
+      없으므로 projects/memos 의 updated_at 을 각각 created_at 과 동일하게 저장한다.
     - detail 히스토리 정렬은 (reg_dtm, content). UNIQUE(task_id, content) 라 순서가 결정적이다.
 
 사용 예 (로컬 — 대상 기본값은 레포 .env 의 DB_*):
@@ -34,7 +35,7 @@
         --target-password '...' --target-database <db> \
         --owner-user-id '<auth account id>'
 
-    --dry-run  : 대상에 SQL 을 실제 실행해 제약 위반까지 검증한 뒤 커밋 대신 롤백.
+    --dry-run  : 소스/대상 메타데이터와 건수를 SELECT 로만 읽어 실행 계획을 리포트.
     --replace  : 대상 todo 테이블(articles/memo_versions/memos/project_members/projects)을
                  비우고 적재. 반드시 --confirm-replace <target database 이름> 을 함께 요구한다.
 
@@ -59,6 +60,7 @@ import argparse
 import os
 import sys
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pymysql
@@ -113,7 +115,26 @@ def parse_args() -> argparse.Namespace:
         default="legacy",
         help="legacy: 레거시 스키마 변환 적재 / mirror: 현행 스키마 DB 를 그대로 복사",
     )
-    parser.add_argument("--dry-run", action="store_true", help="SQL 실행 후 커밋 대신 롤백")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="대상에는 SELECT만 실행해 적재 계획과 건수를 리포트",
+    )
+    parser.add_argument(
+        "--wipe-daily-tasks",
+        action="store_true",
+        help="--replace 시 daily_task_types/completions 도 함께 비운다 (오프라인 동기화 부트스트랩)",
+    )
+    parser.add_argument(
+        "--sync-applying",
+        action="store_true",
+        help="대상 커넥션에 SET @sync_applying = 1 — 적재분이 change_log 에 남지 않게 한다",
+    )
+    parser.add_argument(
+        "--allow-missing-utc",
+        action="store_true",
+        help="mirror 모드에서 소스의 updated_at_utc 가 비어 있어도 진행",
+    )
     parser.add_argument(
         "--replace",
         action="store_true",
@@ -138,6 +159,22 @@ def parse_args() -> argparse.Namespace:
             "마이그레이션된 프로젝트의 소유자/멤버십 계정 id 입니다."
         )
     return args
+
+
+KST = timezone(timedelta(hours=9))
+
+
+def to_utc_naive(value):
+    """레거시 naive 시각(Asia/Seoul 벽시계) → naive UTC.
+
+    Asia/Seoul 은 1988년 이후 DST 가 없으므로 고정 +09:00 오프셋이 정확하다.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        moment = value if value.tzinfo else value.replace(tzinfo=KST)
+        return moment.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
 
 
 def connect(host: str, port: int, user: str, password: str, database: str):
@@ -191,11 +228,23 @@ def table_columns(cursor, table: str) -> list[str]:
 
 
 def ensure_status_columns(cursor) -> None:
-    """구버전 대상 스키마 보강 — 이미 있으면(1060) 무시."""
-    for sql in (
-        "ALTER TABLE projects ADD COLUMN status INT NOT NULL DEFAULT 0 AFTER icon",
-        "ALTER TABLE memos ADD COLUMN status INT NOT NULL DEFAULT 0 AFTER content",
+    """구버전 대상 스키마 보강.
+
+    존재하는 컬럼에 ALTER 를 시도하지 않는다. MySQL DDL 은 auto-commit 이므로 호출자가
+    트랜잭션 안에 있더라도 불필요한 DDL 시도 자체를 피해야 한다.
+    """
+    for table, sql in (
+        (
+            "projects",
+            "ALTER TABLE projects ADD COLUMN status INT NOT NULL DEFAULT 0 AFTER icon",
+        ),
+        (
+            "memos",
+            "ALTER TABLE memos ADD COLUMN status INT NOT NULL DEFAULT 0 AFTER content",
+        ),
     ):
+        if "status" in table_columns(cursor, table):
+            continue
         try:
             cursor.execute(sql)
         except pymysql.err.OperationalError as exc:
@@ -203,9 +252,58 @@ def ensure_status_columns(cursor) -> None:
                 raise
 
 
-def clear_target(cursor) -> None:
+# 오프라인 동기화 부트스트랩에서 함께 비우는 테이블.
+# `articles` 는 projects/memos FK 의 ON DELETE CASCADE 로 자동 삭제되지만 명시해 둔다.
+# `daily_task_*` 는 독립 테이블이라 CASCADE 를 타지 않으므로 **명시적으로** 지운다
+# (원격에서도 daily task 를 쓰지 않기로 확정 — root plan).
+DAILY_TASK_TABLES = ("daily_task_completions", "daily_task_types")
+
+
+def clear_target(cursor, wipe_daily_tasks: bool = False) -> None:
     for table in ("articles", "memo_versions", "memos", "project_members", "projects"):
         cursor.execute(f"DELETE FROM {table}")
+    if wipe_daily_tasks:
+        for table in DAILY_TASK_TABLES:
+            try:
+                cursor.execute(f"DELETE FROM {table}")
+            except pymysql.err.ProgrammingError:
+                pass  # 테이블이 없는 대상 (1146)
+
+
+def check_updated_at_utc(cursor) -> dict[str, int]:
+    """동기화 대상 테이블에서 updated_at_utc 가 비어 있는 행 수 (0 이면 백필 완료)."""
+    missing: dict[str, int] = {}
+    for table in ("projects", "memos", "memo_versions", "project_members"):
+        try:
+            cursor.execute(
+                f"SELECT COUNT(*) AS total FROM `{table}` WHERE updated_at_utc IS NULL"
+            )
+            total = int(cursor.fetchone()["total"])
+        except pymysql.err.OperationalError as exc:
+            if exc.args[0] == 1054:  # 컬럼 없음 = 동기화 스키마 이전 DB
+                total = 0
+            else:
+                raise
+        except pymysql.err.ProgrammingError:
+            total = 0
+        if total:
+            missing[table] = total
+    return missing
+
+
+def target_row_counts(cursor, include_daily_tasks: bool = False) -> dict[str, int]:
+    """wipe 대상 건수 리포트용."""
+    counts: dict[str, int] = {}
+    tables = list(MIRROR_TABLES)
+    if include_daily_tasks:
+        tables.extend(DAILY_TASK_TABLES)
+    for table in tables:
+        try:
+            cursor.execute(f"SELECT COUNT(*) AS total FROM `{table}`")
+            counts[table] = int(cursor.fetchone()["total"])
+        except pymysql.err.ProgrammingError:
+            counts[table] = 0
+    return counts
 
 
 def upsert(cursor, table: str, columns: list[str], values: list, update_columns: list[str]) -> None:
@@ -238,7 +336,16 @@ def migrate_mirror(args: argparse.Namespace) -> int:
             columns = table_columns(cursor, table)
             cursor.execute(f"SELECT * FROM `{table}`")
             rows_by_table[table] = (columns, cursor.fetchall())
+        missing_utc = check_updated_at_utc(cursor)
     source.close()
+
+    if missing_utc and not getattr(args, "allow_missing_utc", False):
+        detail = ", ".join(f"{table}={count}" for table, count in missing_utc.items())
+        raise SystemExit(
+            "소스의 updated_at_utc 가 비어 있는 행이 있습니다 "
+            f"({detail}). 먼저 `python scripts/backfill_updated_at_utc.py` 를 실행하거나 "
+            "--allow-missing-utc 를 지정하세요. 이 값이 없으면 충돌 판정(LWW)이 성립하지 않습니다."
+        )
     print("source:", " ".join(f"{t}={len(rows_by_table[t][1])}" for t in MIRROR_TABLES))
 
     target = connect(
@@ -247,9 +354,41 @@ def migrate_mirror(args: argparse.Namespace) -> int:
     stats = defaultdict(int)
     try:
         with target.cursor() as cursor:
+            if args.dry_run:
+                before = target_row_counts(
+                    cursor, getattr(args, "wipe_daily_tasks", False)
+                )
+                print(
+                    "[dry-run] wipe 대상 건수:",
+                    " ".join(f"{table}={count}" for table, count in before.items()),
+                )
+                for table in MIRROR_TABLES:
+                    source_columns, rows = rows_by_table[table]
+                    target_columns = table_columns(cursor, table)
+                    copied = [column for column in source_columns if column in target_columns]
+                    skipped = [
+                        column for column in source_columns if column not in target_columns
+                    ]
+                    print(
+                        f"  {table}: 적재 예정 {len(rows)}행, "
+                        f"공통 컬럼 {len(copied)}개"
+                        + (f", 대상에 없는 컬럼 {skipped}" if skipped else "")
+                    )
+                    stats[table] = len(rows)
+                print("[dry-run] 대상 DB에는 SELECT만 실행했습니다 (DB 무변경).")
+                print(
+                    "upserted:",
+                    " ".join(f"{table}=0 (예정 {stats[table]})" for table in MIRROR_TABLES),
+                )
+                return 0
+
+            if getattr(args, "sync_applying", False):
+                cursor.execute("SET @sync_applying = 1")
             ensure_status_columns(cursor)
             if args.replace:
-                clear_target(cursor)
+                before = target_row_counts(cursor, getattr(args, "wipe_daily_tasks", False))
+                print("[replace] wipe 대상 건수:", " ".join(f"{t}={n}" for t, n in before.items()))
+                clear_target(cursor, getattr(args, "wipe_daily_tasks", False))
                 print("[replace] 대상 todo 테이블을 비웠습니다.")
             for table in MIRROR_TABLES:
                 source_columns, rows = rows_by_table[table]
@@ -263,12 +402,8 @@ def migrate_mirror(args: argparse.Namespace) -> int:
                     upsert(cursor, table, columns, [row[c] for c in columns], update_columns)
                     stats[table] += 1
 
-        if args.dry_run:
-            target.rollback()
-            print("[dry-run] 모든 SQL 실행 후 롤백했습니다 (대상 무변경).")
-        else:
-            target.commit()
-            print("커밋 완료.")
+        target.commit()
+        print("커밋 완료.")
     except Exception:
         target.rollback()
         raise
@@ -302,7 +437,6 @@ def migrate_legacy(args: argparse.Namespace) -> int:
     stats = defaultdict(int)
     try:
         with target.cursor() as cursor:
-            ensure_status_columns(cursor)
             # 스키마 드리프트 감지: 실DB 에만 존재하는 소유자 컬럼은 있을 때만 채운다
             has_project_owner = "owner_id" in table_columns(cursor, "projects")
             has_memo_creator = "created_by" in table_columns(cursor, "memos")
@@ -311,14 +445,35 @@ def migrate_legacy(args: argparse.Namespace) -> int:
                 f"memos.created_by={'있음' if has_memo_creator else '없음'}"
             )
 
+            if args.dry_run:
+                before = target_row_counts(
+                    cursor, getattr(args, "wipe_daily_tasks", False)
+                )
+                print(
+                    "[dry-run] 대상 현재 건수:",
+                    " ".join(f"{table}={count}" for table, count in before.items()),
+                )
+                print(
+                    "[dry-run] 적재 예정: "
+                    f"projects={len(projects)} members={len(projects)} "
+                    f"memos={len(tasks)} "
+                    f"versions={sum(max(len(rows) - 1, 0) for rows in details.values())}"
+                )
+                print("[dry-run] 대상 DB에는 SELECT만 실행했습니다 (DB 무변경).")
+                return 0
+
+            ensure_status_columns(cursor)
             if args.replace:
-                clear_target(cursor)
+                clear_target(cursor, getattr(args, "wipe_daily_tasks", False))
                 print("[replace] 대상 todo 테이블을 비웠습니다.")
 
             for project in projects:
                 project_uuid = f"legacy-project-{project['project_id']}"
                 icon = (project["project_icon"] or DEFAULT_ICON)[:ICON_MAX_LEN]
-                columns = ["id", "name", "icon", "status", "is_secret", "created_at", "updated_at"]
+                columns = [
+                    "id", "name", "icon", "status", "is_secret",
+                    "created_at", "updated_at", "updated_at_utc",
+                ]
                 values = [
                     project_uuid,
                     project["project_name"] or UNTITLED,
@@ -327,17 +482,27 @@ def migrate_legacy(args: argparse.Namespace) -> int:
                     False,
                     project["reg_dtm"],
                     project["reg_dtm"],
+                    to_utc_naive(project["reg_dtm"]),
                 ]
                 if has_project_owner:
                     columns.insert(1, "owner_id")
                     values.insert(1, args.owner_user_id)
-                upsert(cursor, "projects", columns, values, ["name", "icon", "status", "created_at"])
+                upsert(
+                    cursor,
+                    "projects",
+                    columns,
+                    values,
+                    ["name", "icon", "status", "created_at", "updated_at", "updated_at_utc"],
+                )
                 stats["projects"] += 1
 
                 upsert(
                     cursor,
                     "project_members",
-                    ["id", "project_id", "user_id", "username", "display_name", "email", "role", "invited_at"],
+                    [
+                        "id", "project_id", "user_id", "username", "display_name",
+                        "email", "role", "invited_at", "updated_at_utc",
+                    ],
                     [
                         f"legacy-project-member-{project['project_id']}",
                         project_uuid,
@@ -347,8 +512,16 @@ def migrate_legacy(args: argparse.Namespace) -> int:
                         args.owner_email,
                         "owner",
                         project["reg_dtm"],
+                        to_utc_naive(project["reg_dtm"]),
                     ],
-                    ["role", "username", "display_name", "email"],
+                    [
+                        "role",
+                        "username",
+                        "display_name",
+                        "email",
+                        "invited_at",
+                        "updated_at_utc",
+                    ],
                 )
                 stats["members"] += 1
 
@@ -357,17 +530,21 @@ def migrate_legacy(args: argparse.Namespace) -> int:
                 history = details.get(task["task_id"], [])
                 latest = history[-1] if history else None
                 content = latest["content"] if latest else ""
-                updated_at = latest["reg_dtm"] if latest else task["reg_dtm"]
+                created_at = task["reg_dtm"]
 
-                columns = ["id", "project_id", "title", "content", "status", "created_at", "updated_at"]
+                columns = [
+                    "id", "project_id", "title", "content", "status",
+                    "created_at", "updated_at", "updated_at_utc",
+                ]
                 values = [
                     memo_uuid,
                     f"legacy-project-{task['project_id']}",
                     (task["task_title"] or UNTITLED)[:255],
                     content,
                     task["task_status"] or 0,
-                    task["reg_dtm"],
-                    updated_at,
+                    created_at,
+                    created_at,
+                    to_utc_naive(created_at),
                 ]
                 if has_memo_creator:
                     columns.insert(2, "created_by")
@@ -377,7 +554,7 @@ def migrate_legacy(args: argparse.Namespace) -> int:
                     "memos",
                     columns,
                     values,
-                    ["title", "content", "status", "created_at", "updated_at"],
+                    ["title", "content", "status", "created_at", "updated_at", "updated_at_utc"],
                 )
                 stats["memos"] += 1
 
@@ -386,24 +563,21 @@ def migrate_legacy(args: argparse.Namespace) -> int:
                     upsert(
                         cursor,
                         "memo_versions",
-                        ["id", "memo_id", "content", "version", "created_at"],
+                        ["id", "memo_id", "content", "version", "created_at", "updated_at_utc"],
                         [
                             f"legacy-version-{task['task_id']}-{version}",
                             memo_uuid,
                             row["content"],
                             version,
                             row["reg_dtm"],
+                            to_utc_naive(row["reg_dtm"]),
                         ],
-                        ["content", "version", "created_at"],
+                        ["content", "version", "created_at", "updated_at_utc"],
                     )
                     stats["versions"] += 1
 
-        if args.dry_run:
-            target.rollback()
-            print("[dry-run] 모든 SQL 실행 후 롤백했습니다 (대상 무변경).")
-        else:
-            target.commit()
-            print("커밋 완료.")
+        target.commit()
+        print("커밋 완료.")
     except Exception:
         target.rollback()
         raise

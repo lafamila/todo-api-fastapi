@@ -21,7 +21,8 @@ def check_project_membership(cursor, project_id: str, user: dict):
         return True
 
     cursor.execute(
-        "SELECT id FROM project_members WHERE project_id = %s AND user_id = %s",
+        "SELECT id FROM project_members "
+        "WHERE project_id = %s AND user_id = %s AND deleted_at IS NULL",
         (project_id, user["id"]),
     )
     if cursor.fetchone():
@@ -35,7 +36,8 @@ def get_project_role(cursor, project_id: str, user: dict) -> str | None:
         return PROJECT_OWNER_ROLE
 
     cursor.execute(
-        "SELECT role FROM project_members WHERE project_id = %s AND user_id = %s",
+        "SELECT role FROM project_members "
+        "WHERE project_id = %s AND user_id = %s AND deleted_at IS NULL",
         (project_id, user["id"]),
     )
     member = cursor.fetchone()

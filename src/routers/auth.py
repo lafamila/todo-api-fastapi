@@ -55,8 +55,24 @@ async def session_logout(request: Request, response: Response):
 
 @router.get("/session/me")
 async def session_me(request: Request):
-    """현재 todo 세션 사용자를 반환한다."""
+    """현재 todo 세션 사용자를 반환한다 (오프라인 세션이면 `offline: true`)."""
     return await get_session_service().get_user(request)
+
+
+@router.post("/session/local")
+async def session_local(request: Request, response: Response):
+    """원격 auth 가 닿지 않을 때 캐시된 신원으로 무기한 로컬 세션을 발급한다.
+
+    최초 1회는 반드시 원격 auth 로그인이 필요하고(그때 신원이 캐시된다), loopback 요청만
+    허용한다. 노트북 오프라인 스택 전용 경로다 (`TODO_LOCAL_SESSION_ENABLED`).
+    """
+    return await get_session_service().start_local_session(request, response)
+
+
+@router.get("/session/local/identity")
+async def session_local_identity(request: Request):
+    """신뢰된 로컬 클라이언트에 오프라인 로그인 가능 여부만 반환한다."""
+    return await get_session_service().get_local_identity_info(request)
 
 
 @router.post("/session/service-application")

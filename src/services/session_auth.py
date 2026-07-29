@@ -1,10 +1,11 @@
 import asyncio
+import ipaddress
 import json
 from dataclasses import dataclass, field
 from http.cookies import SimpleCookie
 from threading import RLock
 from time import time
-from typing import Any
+from typing import Any, Callable
 from urllib import error, parse, request
 
 from fastapi import HTTPException, Request, Response
@@ -13,6 +14,7 @@ from fastapi.responses import RedirectResponse
 try:
     from ..config import (
         AUTH_API_BASE_URL,
+        AUTH_PUBLIC_BASE_URL,
         AUTH_SERVICE_KEY_ID,
         AUTH_SERVICE_SECRET,
         TODO_OIDC_CLIENT_ID,
@@ -26,10 +28,19 @@ try:
         TODO_SESSION_MAX_AGE_SECONDS,
         TODO_WEB_BASE_URL,
     )
+    from ..config import (
+        AUTH_ISSUER_URL,
+        SYNC_ACCOUNT_ID,
+        TODO_LOCAL_SESSION_ENABLED,
+        runs_sync_daemon,
+    )
+    from ..connectors import get_db_connection
     from ..token_verifier import build_user_from_payload, decode_auth_api_token, serialize_user
+    from .sync_store import get_local_identity, identity_to_user, upsert_local_identity
 except ImportError:  # pragma: no cover
     from config import (
         AUTH_API_BASE_URL,
+        AUTH_PUBLIC_BASE_URL,
         AUTH_SERVICE_KEY_ID,
         AUTH_SERVICE_SECRET,
         TODO_OIDC_CLIENT_ID,
@@ -43,7 +54,15 @@ except ImportError:  # pragma: no cover
         TODO_SESSION_MAX_AGE_SECONDS,
         TODO_WEB_BASE_URL,
     )
+    from config import (
+        AUTH_ISSUER_URL,
+        SYNC_ACCOUNT_ID,
+        TODO_LOCAL_SESSION_ENABLED,
+        runs_sync_daemon,
+    )
+    from connectors import get_db_connection
     from token_verifier import build_user_from_payload, decode_auth_api_token, serialize_user
+    from services.sync_store import get_local_identity, identity_to_user, upsert_local_identity
 
 
 class _NoRedirectHandler(request.HTTPRedirectHandler):
@@ -55,6 +74,48 @@ LOGIN_SCOPE = "openid profile email service.permission"
 LOGIN_TRANSACTION_TTL_SECONDS = 10 * 60
 TODO_WEB_DEFAULT_RETURN_PATH = "/"
 TODO_WEB_LOGIN_PATH = "/login"
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    if not host:
+        return False
+    normalized = host.strip().lower().strip("[]")
+    if normalized in _LOOPBACK_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_private_host(host: str | None) -> bool:
+    if not host:
+        return False
+    try:
+        address = ipaddress.ip_address(host.strip().strip("[]"))
+        return address.is_private
+    except ValueError:
+        return False
+
+
+def _origin_host(origin: str | None) -> str | None:
+    if not origin:
+        return None
+    return parse.urlsplit(origin).hostname
+
+
+def _is_trusted_local_topology(
+    *, client_host: str | None, target_host: str | None, origin: str | None
+) -> bool:
+    """직접 loopback 또는 Docker bridge를 통한 localhost 브라우저 요청만 신뢰한다."""
+    if _is_loopback_host(client_host):
+        return True
+    return (
+        _is_private_host(client_host)
+        and _is_loopback_host(target_host)
+        and _is_loopback_host(_origin_host(origin))
+    )
 
 
 @dataclass
@@ -64,7 +125,12 @@ class TodoSession:
     refresh_token: str
     access_token_expires_at: float
     user: dict
+    issuer: str | None = None
     refresh_lock: Any = field(default_factory=RLock)
+    # 원격 auth 가 닿지 않을 때 캐시된 신원으로 발급한 **무기한** 로컬 세션.
+    # 만료로 인한 보호를 포기하는 대가로 오프라인 무기한 동작을 얻는다.
+    # 전제: 로컬 API 는 loopback에 게시되고 sync client 역할에서만 허용한다.
+    offline: bool = False
 
 
 @dataclass
@@ -98,6 +164,7 @@ class OidcCallbackError(Exception):
 class TodoSessionService:
     def __init__(self) -> None:
         self.auth_api_base_url = AUTH_API_BASE_URL
+        self.auth_public_base_url = AUTH_PUBLIC_BASE_URL
         self.client_id = TODO_OIDC_CLIENT_ID
         self.client_secret = TODO_OIDC_CLIENT_SECRET
         self.redirect_uri = TODO_OIDC_REDIRECT_URI
@@ -106,6 +173,7 @@ class TodoSessionService:
         self._sessions: dict[str, TodoSession] = {}
         self.todo_web_base_url = TODO_WEB_BASE_URL
         self._login_transactions: dict[str, OidcLoginTransaction] = {}
+        self._session_invalidation_listeners: list[Callable[[str], None]] = []
         self._lock = RLock()
 
     async def start_login(self, return_to: str | None) -> dict:
@@ -133,25 +201,156 @@ class TodoSessionService:
     async def logout(self, request: Request, response: Response) -> None:
         session = self._get_request_session(request)
         if session is not None:
-            await asyncio.to_thread(self._revoke_refresh_token_safe, session.refresh_token)
             self._delete_session(session.id)
+            if session.refresh_token:
+                await asyncio.to_thread(
+                    self._revoke_refresh_token_safe, session.refresh_token
+                )
         self._clear_session_cookie(response)
 
     async def get_user(self, request: Request) -> dict:
         session = await self.require_valid_session(request)
-        return serialize_user(session.user)
+        return {**serialize_user(session.user), "offline": session.offline}
 
     async def require_valid_session(self, request: Request) -> TodoSession:
         session = self._get_request_session(request)
         if session is None:
             raise HTTPException(status_code=401, detail="Todo session is required")
-        return await asyncio.to_thread(self._refresh_if_needed_sync, session.id)
+        if session.offline:
+            self._require_local_session_request(request)
+            return session
+        return await asyncio.to_thread(
+            self._refresh_if_needed_sync,
+            session.id,
+            self._local_session_request_allowed(request),
+        )
+
+    # -- 오프라인 로컬 세션 -------------------------------------------------
+
+    async def start_local_session(self, request: Request, response: Response) -> dict:
+        """원격 auth 가 닿지 않을 때 **캐시된 신원으로 무기한 로컬 세션**을 발급한다.
+
+        최초 1회는 반드시 원격 auth 로 로그인해야 한다 (그때 신원이 캐시된다).
+        트레이드오프는 "노트북 접근자가 로컬 데이터에 접근 가능" 이며, 로컬 MySQL 이 이미
+        평문이므로 새로 생기는 위험은 아니다. 그래서 신뢰된 로컬 요청만 허용한다.
+        """
+        self._require_local_session_request(request)
+
+        identity = await asyncio.to_thread(self._load_identity, SYNC_ACCOUNT_ID)
+        if not _identity_matches(identity, SYNC_ACCOUNT_ID, AUTH_ISSUER_URL):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "identity_not_cached",
+                    "message": "캐시된 신원이 없습니다. 온라인일 때 원격 auth 로 최소 1회 로그인하세요.",
+                },
+            )
+
+        session = TodoSession(
+            id=_random_token(32),
+            access_token="",
+            refresh_token="",
+            access_token_expires_at=float("inf"),
+            user=identity_to_user(identity),
+            issuer=identity.get("issuer"),
+            offline=True,
+        )
+        self._store_session(session)
+        self._set_session_cookie(response, session.id)
+        return {
+            **serialize_user(session.user),
+            "offline": True,
+            "identityVerifiedAt": _iso_or_none(identity.get("verified_at_utc")),
+        }
+
+    async def get_local_identity_info(self, request: Request) -> dict:
+        """로컬 로그인 가능 여부만 공개한다. 캐시된 개인정보는 인증 전 노출하지 않는다."""
+        self._require_local_session_request(request)
+        identity = await asyncio.to_thread(self._load_identity, SYNC_ACCOUNT_ID)
+        return {
+            "available": _identity_matches(
+                identity, SYNC_ACCOUNT_ID, AUTH_ISSUER_URL
+            )
+        }
+
+    def _local_session_request_allowed(self, request: Request) -> bool:
+        return self.local_session_connection_allowed(
+            client_host=request.client.host if request.client else None,
+            target_host=request.url.hostname,
+            origin=request.headers.get("origin") or request.headers.get("referer"),
+        )
+
+    def local_session_connection_allowed(
+        self, *, client_host: str | None, target_host: str | None, origin: str | None
+    ) -> bool:
+        if not TODO_LOCAL_SESSION_ENABLED or not runs_sync_daemon():
+            return False
+        return _is_trusted_local_topology(
+            client_host=client_host,
+            target_host=target_host,
+            origin=origin,
+        )
+
+    def _require_local_session_request(self, request: Request) -> None:
+        if not TODO_LOCAL_SESSION_ENABLED:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "local_session_disabled",
+                    "message": "TODO_LOCAL_SESSION_ENABLED=false — 오프라인 로컬 세션이 꺼져 있습니다.",
+                },
+            )
+        if not runs_sync_daemon():
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "local_session_wrong_role",
+                    "message": "오프라인 로컬 세션은 sync client 배포에서만 허용합니다.",
+                },
+            )
+        if not self._local_session_request_allowed(request):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "loopback_required",
+                    "message": "오프라인 로컬 세션은 신뢰된 로컬 요청만 허용합니다.",
+                },
+            )
+
+    def _load_identity(
+        self, account_id: str | None, issuer: str | None = AUTH_ISSUER_URL
+    ) -> dict | None:
+        if not account_id or not issuer:
+            return None
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    return get_local_identity(cursor, account_id, issuer)
+        except Exception:  # noqa: BLE001 - 신원 캐시 조회 실패가 로그인 경로를 죽이지 않게
+            return None
+
+    def _cache_identity(self, user: dict, issuer: str | None = None) -> None:
+        """원격 로그인 성공 시 신원을 캐시한다 (오프라인 세션의 유일한 근거)."""
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    upsert_local_identity(cursor, user, issuer or AUTH_ISSUER_URL)
+        except Exception:  # noqa: BLE001 - 캐시 실패가 로그인 자체를 막지 않는다
+            pass
 
     async def get_valid_session_user(self, request: Request) -> dict | None:
         session = self._get_request_session(request)
         if session is None:
             return None
-        valid_session = await asyncio.to_thread(self._refresh_if_needed_sync, session.id)
+        if session.offline:
+            if not self._local_session_request_allowed(request):
+                return None
+            return session.user
+        valid_session = await asyncio.to_thread(
+            self._refresh_if_needed_sync,
+            session.id,
+            self._local_session_request_allowed(request),
+        )
         return valid_session.user
 
     async def create_service_application(self, request: Request, message: str | None) -> Any:
@@ -234,9 +433,40 @@ class TodoSessionService:
             )
         return results
 
-    def get_session_user_from_cookie_header(self, cookie_header: str | None) -> dict | None:
-        session = self._get_session_by_id(self._parse_session_id(cookie_header))
-        return session.user if session is not None else None
+    async def get_valid_session_from_cookie_header(
+        self, cookie_header: str | None, *, allow_offline: bool = False
+    ) -> TodoSession | None:
+        """소켓 handshake용 세션 검증.
+
+        일반 HTTP 요청과 같은 refresh 경로를 사용하되, 인증 실패는 socket connect가
+        service credential 검증으로 넘어갈 수 있도록 ``None``으로 정규화한다.
+        """
+        return await self.validate_session_id(
+            self._parse_session_id(cookie_header),
+            allow_offline=allow_offline,
+        )
+
+    async def validate_session_id(
+        self, session_id: str | None, *, allow_offline: bool = False
+    ) -> TodoSession | None:
+        session = self._get_session_by_id(session_id)
+        if session is None:
+            return None
+        if session.offline:
+            return session if allow_offline else None
+        try:
+            return await asyncio.to_thread(
+                self._refresh_if_needed_sync,
+                session.id,
+                allow_offline,
+            )
+        except HTTPException:
+            return None
+
+    def on_session_invalidated(self, listener: Callable[[str], None]) -> None:
+        """세션 삭제를 realtime 연결 등 프로세스 내부 소비자에게 알린다."""
+        with self._lock:
+            self._session_invalidation_listeners.append(listener)
 
     def is_session_configured(self) -> bool:
         return True
@@ -297,6 +527,7 @@ class TodoSessionService:
             token = self._exchange_code_for_token(code, transaction.code_verifier)
             session = self._create_session(token)
             self._store_session(session)
+            self._cache_identity(session.user, session.issuer)
         except OidcCallbackError as exc:
             return _CallbackResult(
                 redirect_url=self._build_error_redirect_url(
@@ -329,7 +560,7 @@ class TodoSessionService:
                 "code_challenge_method": "S256",
             }
         )
-        return f"{self.auth_api_base_url}/oauth/authorize?{params}"
+        return f"{self.auth_public_base_url}/oauth/authorize?{params}"
 
     def _exchange_code_for_token(self, code: str, code_verifier: str) -> dict:
         self._ensure_oidc_configured()
@@ -376,7 +607,9 @@ class TodoSessionService:
             raise HTTPException(status_code=503, detail="Invalid token response")
         return response.data
 
-    def _refresh_if_needed_sync(self, session_id: str) -> TodoSession:
+    def _refresh_if_needed_sync(
+        self, session_id: str, allow_offline: bool = False
+    ) -> TodoSession:
         session = self._get_session_by_id(session_id)
         if session is None:
             raise HTTPException(status_code=401, detail="Todo session is required")
@@ -402,10 +635,20 @@ class TodoSessionService:
                         }
                     )
                 except HTTPException as exc:
-                    with self._lock:
-                        current = self._sessions.get(session_id)
-                        if current is not None and current.refresh_token == refresh_token:
-                            self._sessions.pop(session_id, None)
+                    # 네트워크가 끊긴 것과 refresh token 이 거절된 것은 다르게 다뤄야 한다.
+                    # 앞의 경우 로컬 세션이 허용되면 오프라인으로 이어붙인다 (무기한 동작).
+                    if (
+                        exc.status_code >= 502
+                        and TODO_LOCAL_SESSION_ENABLED
+                        and runs_sync_daemon()
+                        and allow_offline
+                    ):
+                        offline_session = self._to_offline_session(session_id)
+                        if offline_session is not None:
+                            return offline_session
+                    self._delete_session_if_refresh_token(
+                        session_id, refresh_token
+                    )
                     raise HTTPException(status_code=401, detail=exc.detail) from exc
 
                 updated = self._create_session(
@@ -414,19 +657,34 @@ class TodoSessionService:
                     refresh_lock=refresh_lock,
                 )
                 with self._lock:
-                    self._sessions[session_id] = updated
+                    current = self._sessions.get(session_id)
+                    replace_session = (
+                        current is not None
+                        and current.refresh_token == refresh_token
+                    )
+                    if replace_session:
+                        self._sessions[session_id] = updated
+                if not replace_session:
+                    self._revoke_refresh_token_safe(updated.refresh_token)
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Todo session is required",
+                    )
                 session = updated
 
         return session
 
     def _revoke_refresh_token_safe(self, refresh_token: str) -> None:
-        response = self._request_json(
-            "POST",
-            f"{self.auth_api_base_url}/oauth/revoke",
-            {"token": refresh_token},
-            None,
-            None,
-        )
+        try:
+            response = self._request_json(
+                "POST",
+                f"{self.auth_api_base_url}/oauth/revoke",
+                {"token": refresh_token},
+                None,
+                None,
+            )
+        except HTTPException:
+            return
         if response.status >= 500:
             return
 
@@ -450,8 +708,41 @@ class TodoSessionService:
             refresh_token=refresh_token,
             access_token_expires_at=time() + int(expires_in),
             user=user,
+            issuer=str(payload.get("iss") or AUTH_ISSUER_URL),
             refresh_lock=refresh_lock or RLock(),
         )
+
+    def _to_offline_session(self, session_id: str) -> TodoSession | None:
+        """만료된 원격 세션을 캐시된 신원 기반 오프라인 세션으로 이어붙인다."""
+        current = self._get_session_by_id(session_id)
+        if current is None:
+            return None
+        account_id = str(
+            current.user.get("account_id") or current.user.get("id") or ""
+        )
+        if not account_id or (SYNC_ACCOUNT_ID and account_id != SYNC_ACCOUNT_ID):
+            return None
+        if not current.issuer:
+            return None
+        identity = self._load_identity(account_id, current.issuer)
+        if not _identity_matches(identity, account_id, current.issuer):
+            return None
+        with self._lock:
+            latest = self._sessions.get(session_id)
+            if latest is not current:
+                return None
+            offline_session = TodoSession(
+                id=session_id,
+                access_token="",
+                refresh_token="",
+                access_token_expires_at=float("inf"),
+                user=identity_to_user(identity),
+                issuer=current.issuer,
+                refresh_lock=current.refresh_lock if current else RLock(),
+                offline=True,
+            )
+            self._sessions[session_id] = offline_session
+        return offline_session
 
     def _get_request_session(self, request_obj: Request) -> TodoSession | None:
         session_id = request_obj.cookies.get(self.cookie_name)
@@ -469,7 +760,28 @@ class TodoSessionService:
 
     def _delete_session(self, session_id: str) -> None:
         with self._lock:
+            deleted = self._sessions.pop(session_id, None)
+        if deleted is not None:
+            self._notify_session_invalidated(session_id)
+
+    def _delete_session_if_refresh_token(
+        self, session_id: str, refresh_token: str
+    ) -> None:
+        with self._lock:
+            current = self._sessions.get(session_id)
+            if current is None or current.refresh_token != refresh_token:
+                return
             self._sessions.pop(session_id, None)
+        self._notify_session_invalidated(session_id)
+
+    def _notify_session_invalidated(self, session_id: str) -> None:
+        with self._lock:
+            listeners = tuple(self._session_invalidation_listeners)
+        for listener in listeners:
+            try:
+                listener(session_id)
+            except Exception:  # noqa: BLE001 - 한 소비자가 logout을 깨뜨리지 않게
+                pass
 
     def _pop_login_transaction(self, state: str | None) -> OidcLoginTransaction | None:
         if not state:
@@ -587,6 +899,26 @@ _session_service = TodoSessionService()
 
 def get_session_service() -> TodoSessionService:
     return _session_service
+
+
+def _identity_matches(
+    identity: dict | None, account_id: str | None, issuer: str | None
+) -> bool:
+    return bool(
+        identity
+        and account_id
+        and issuer
+        and str(identity.get("account_id") or "") == account_id
+        and str(identity.get("issuer") or "") == issuer
+    )
+
+
+def _iso_or_none(value: Any) -> str | None:
+    try:
+        from ..timeutil import iso_utc
+    except ImportError:  # pragma: no cover
+        from timeutil import iso_utc
+    return iso_utc(value) if value is not None else None
 
 
 def _decode_json(raw: str) -> Any:

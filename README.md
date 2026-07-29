@@ -8,7 +8,7 @@ Todo 백엔드 API 서버입니다. FastAPI와 MariaDB를 사용하여 구현되
 
 - **프레임워크**: FastAPI
 - **데이터베이스**: MariaDB
-- **언어**: Python 3.8+
+- **언어**: Python 3.13
 
 ## 디렉터리 구조
 
@@ -36,10 +36,10 @@ MariaDB는 root infra compose 또는 별도 운영 DB 를 사용하면 됩니다
 
 ```env
 DB_HOST=localhost
-DB_PORT=3306
+DB_PORT=33306
 DB_USER=root
-DB_PASSWORD=your_password
-DB_NAME=todo
+DB_PASSWORD=
+DB_NAME=teddynote
 ```
 
 Todo 로그인은 auth-api-nest hosted OIDC login 을 통해 시작됩니다. todo-api-fastapi 는 브라우저로부터 중앙 계정 ID/PW 를 받지 않고, `/api/session/oidc/start` 에서 authorize URL 을 발급한 뒤 `TODO_OIDC_REDIRECT_URI` callback 에서 code 를 교환해 todo 세션 쿠키를 만듭니다.
@@ -49,11 +49,11 @@ Auth 계정 검색 기능을 사용하려면 `auth-api-nest` 에 todo 서비스 
 ```env
 AUTH_API_BASE_URL=http://localhost:3032
 TODO_OIDC_CLIENT_ID=todo-web
-TODO_OIDC_CLIENT_SECRET=todo_oidc_client_secret
+TODO_OIDC_CLIENT_SECRET=
 TODO_OIDC_REDIRECT_URI=http://localhost:8000/api/todo/session/callback
 TODO_WEB_BASE_URL=http://localhost:3034
 AUTH_SERVICE_KEY_ID=todo_service_key_id
-AUTH_SERVICE_SECRET=todo_service_secret
+AUTH_SERVICE_SECRET=
 ```
 
 Todo OIDC client, permission definitions, service credential scope 변경은 auth admin 에서 직접 수정하지 않고 todo 서비스가 service onboarding update request 를 제출한 뒤 승인받는 방식으로 진행합니다.
@@ -75,15 +75,54 @@ python __main__.py
 
 서버는 `http://localhost:8000`에서 실행됩니다.
 
-### 4. Docker 이미지 빌드
+### 4. Docker
 
-독립 배포용 이미지 빌드:
+운영 이미지는 Python 3.13 slim 기반이며 non-root 사용자로 실행됩니다.
+이미지만 독립적으로 빌드하려면 다음 명령을 사용합니다.
 
 ```bash
 docker build -t todo-api-fastapi .
 ```
 
-이미지 실행 시 `.env` 또는 운영 환경변수를 런타임에 주입하세요. 이 레포는 더 이상 root compose 의 `fastapi` 앱 서비스명을 기준으로 설명하지 않습니다.
+로컬 Docker 개발은 workspace root의 단일 Compose가 API와 Web을 함께
+관리합니다.
+
+```bash
+# Workspace root
+docker compose -f .scripts/todo/compose.yml up -d --build
+
+# 종료
+docker compose -f .scripts/todo/compose.yml down
+```
+
+개발 API는 호스트의 `127.0.0.1:20022`에만 공개되고 소스 변경 시 reload 됩니다.
+개발 브라우저 origin과 로그인 후 복귀 주소는 `http://localhost:3030`입니다.
+컨테이너에서 호스트의 MariaDB(`33306`), auth(`3032`), LiveKit(`7880`)에 접근할
+때는 `host.docker.internal`을 사용하며 Linux Docker의 `host-gateway`도
+등록합니다. 브라우저 authorize URL과 JWT issuer는
+`AUTH_PUBLIC_BASE_URL=http://localhost:3032`,
+`AUTH_ISSUER_URL=http://localhost:3032`로 유지하고 server-to-server 요청과
+JWKS 조회만 `host.docker.internal`을 사용합니다. OIDC callback은 브라우저가
+접근할 수 있는 `http://localhost:20022/api/todo/session/callback`으로
+유지됩니다.
+
+통합 Compose는 이 레포의 `.env`를 런타임에만 읽습니다. 실제 비밀번호, OIDC
+client secret, service credential, LiveKit secret은 이미지나 Compose 파일에
+기록하지 마세요. MariaDB host port만 `TODO_DB_HOST_PORT`로 재정의할 수
+있습니다.
+
+운영에서는 app Compose를 사용하지 않습니다. `/volume1/www` 아래에 두 레포와
+workspace `.scripts`가 있다고 가정하고 다음 스크립트가 pull → build → 기존
+container 제거 → `teddy-infra` network에서 run → health 확인을 수행합니다.
+
+```bash
+cd /volume1/www
+./.scripts/deploy-todo-prod.sh --dry-run
+./.scripts/deploy-todo-prod.sh
+```
+
+API 운영 `.env`에서 같은 Docker network의 MySQL을 사용한다면
+`DB_HOST=teddy-mysql`, `DB_PORT=3306`으로 설정합니다.
 
 ## 배포/연동 메모
 
@@ -91,6 +130,39 @@ docker build -t todo-api-fastapi .
 - Auth 는 독립 배포된 `auth-api-nest` 의 URL/JWKS/service credential 을 사용합니다.
 - LiveKit 토큰 API 를 쓰는 경우 `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` 를 별도 주입해야 합니다.
 - 프론트엔드 origin 과 세션 쿠키 동작은 `TODO_ALLOWED_ORIGINS`, `TODO_SESSION_COOKIE_*`, `TODO_WEB_BASE_URL` 로 맞춥니다.
+
+## 오프라인 동기화 (`SYNC_*`)
+
+같은 이미지가 양쪽에 배포되고 **역할은 env 로 갈립니다**. 자세한 설계·정책은
+`CLAUDE.md` 의 **OFFLINE SYNC** 섹션을 보세요.
+
+| 배포 대상 | 필수 env |
+|---|---|
+| 운영(NAS) = 동기화 **서버** | `SYNC_ENABLED=true`, `SYNC_PEER_URL` **비움**, `SYNC_ACCOUNT_ID`, `AUTH_SERVICE_KEY_ID`/`AUTH_SERVICE_SECRET`(자기 인증용), 선택 `AUTH_VERIFY_URL` |
+| 노트북 = 동기화 **클라이언트** | `SYNC_ENABLED=true`, `SYNC_PEER_URL=https://todo.lafamila.xyz`, `SYNC_KEY_ID`/`SYNC_SECRET`(auth 발급 scope `sync`), `SYNC_CLIENT_ID`, `TODO_LOCAL_SESSION_ENABLED=true` |
+| 개발용 2번째 스택 | `SYNC_ENABLED=false` (그 외 `SYNC_*` 불필요) |
+
+튜닝값은 전부 기본값이 있습니다: `SYNC_POLL_SECONDS`(60), `SYNC_PUSH_DEBOUNCE_MS`(1000),
+`SYNC_OFFLINE_BACKOFF_SECONDS`(30), `SYNC_CLOCK_SKEW_LIMIT_SECONDS`(5),
+`SYNC_VERIFY_CACHE_SECONDS`(300), `SYNC_BATCH_LIMIT`(500), `SYNC_ALLOW_SCHEMA_DRIFT`(false),
+`SYNC_DAEMON_AUTOSTART`(true), `SYNC_LOCK_TTL_SECONDS`(120), `SYNC_HTTP_TIMEOUT_SECONDS`(15),
+`SYNC_REQUIRED_SCOPE`(sync), `SYNC_BACKUP_DIR`(`../.backups/db`). 전체 목록은 `.env.example`.
+
+```bash
+# 상태 진단 (신원·스키마·커서·이슈·트리거)
+venv/bin/python -m src.sync_cli doctor
+
+# 최초 1회: 로컬 owner id 를 원격 계정 id 로 맞춤
+venv/bin/python -m src.sync_cli link-identity --dry-run
+venv/bin/python -m src.sync_cli link-identity
+
+# 일시 정지 / 재개
+venv/bin/python -m src.sync_cli pause
+venv/bin/python -m src.sync_cli resume
+```
+
+`updated_at_utc` 백필은 서버 기동 시 `init_db()` 가 멱등하게 처리합니다.
+명시적으로 확인/실행하려면 `venv/bin/python scripts/backfill_updated_at_utc.py --dry-run`.
 
 ## API 엔드포인트
 
