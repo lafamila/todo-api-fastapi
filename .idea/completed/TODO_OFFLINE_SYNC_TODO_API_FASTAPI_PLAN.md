@@ -1,6 +1,8 @@
 ---
-status: IN_PROGRESS
+status: COMPLETED
 summary: "오프라인 로컬 스택과 NAS 원격을 양방향 동기화하는 스키마·트리거·sync 엔드포인트·데몬·오프라인 세션·병합 API·CLI 를 구현한다."
+completed_at: 2026-07-30
+completion_reason: "auth verify 엔드포인트·양방향 동기화·부트스트랩·실시간(socket) 검증까지 전부 배포 완료."
 ---
 
 # TODO OFFLINE SYNC — todo-api-fastapi execution plan
