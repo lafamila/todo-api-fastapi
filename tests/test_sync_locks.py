@@ -237,6 +237,21 @@ class RealtimeDelegationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("memo-1", server.socket_locks["sid-1"])
         self.assertEqual(server.sio.emits[-1][0], "lockLeaseRenewed")
 
+    async def test_sync_disabled_uses_local_renewable_lock(self) -> None:
+        server = self._server()
+        peer = _Peer(SyncPeerUnreachable("must not be called"))
+
+        with (
+            patch.object(realtime, "runs_sync_daemon", return_value=False),
+            patch.object(realtime, "get_sync_peer", return_value=peer),
+        ):
+            await server._acquire_lock("sid-1", "memo-1", renewal=False)
+            await server._acquire_lock("sid-1", "memo-1", renewal=True)
+
+        self.assertIsNotNone(server.lock_registry.holder("memo-1"))
+        self.assertIn("memo-1", server.socket_locks["sid-1"])
+        self.assertEqual(server.sio.emits[-1][0], "lockLeaseRenewed")
+
     async def test_uninitialized_sync_state_does_not_use_local_lock(self) -> None:
         server = self._server()
         runtime = _Runtime(online=False)
