@@ -1,5 +1,5 @@
 ---
-status: PREPARED
+status: IN_PROGRESS
 summary: "오프라인 로컬 스택과 NAS 원격을 양방향 동기화하는 스키마·트리거·sync 엔드포인트·데몬·오프라인 세션·병합 API·CLI 를 구현한다."
 ---
 
