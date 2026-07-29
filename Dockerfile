@@ -20,6 +20,9 @@ RUN python -m pip install --no-cache-dir -r requirements.txt
 
 # `.env`는 이미지에 복사하지 않고 런타임에만 주입한다.
 COPY --chown=app:app src/ ./src/
+# COPY 는 빌드 컨텍스트의 모드 비트를 보존한다 — NAS 체크아웃 umask 가 제한적이면
+# 디렉토리 x 비트가 빠져 소유자(app)도 import 를 못 한다. 모드를 정규화한다.
+RUN chmod -R u+rwX,go+rX ./src
 
 EXPOSE 8000
 
