@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from time import monotonic
+from time import monotonic, sleep
 
 try:
     import socketio
@@ -57,6 +57,7 @@ try:
         max_change_seq,
         pending_sync_retry_count,
         record_issue,
+        resolve_issues,
         set_row_sync_clock,
         update_sync_state,
     )
@@ -91,12 +92,16 @@ except ImportError:  # pragma: no cover
         max_change_seq,
         pending_sync_retry_count,
         record_issue,
+        resolve_issues,
         set_row_sync_clock,
         update_sync_state,
     )
 
 
 logger = logging.getLogger(__name__)
+
+# 편차 초과 감지 시 재측정 전 대기 (슬립 복귀 스파이크 필터) — 테스트는 0 으로 바꾼다.
+CLOCK_SPIKE_RECHECK_SECONDS = 2.0
 
 MAX_ROUNDS_PER_CYCLE = 20
 # 소켓 구독 재시도 간격 (구독은 가속기이므로 오프라인 백오프보다 짧게 잡는다)
@@ -260,6 +265,7 @@ class SyncDaemon:
                 update_sync_state(
                     cursor, self.client_id, last_ok_at=utcnow_naive(), last_error=None
                 )
+                self._resolve_stale_gate_issues(cursor)
 
         return {
             "ok": True,
@@ -311,18 +317,58 @@ class SyncDaemon:
 
     def _check_clock(self, handshake: dict) -> None:
         """시계가 틀어진 LWW 는 조용히 최신 내용을 버린다 — 그래서 편차를 먼저 잡는다."""
+        skew = self._measure_skew(handshake)
+        if skew is None:
+            return
+        self.runtime.clock_skew_seconds = round(skew, 3)
+        if skew <= SYNC_CLOCK_SKEW_LIMIT_SECONDS:
+            return
+
+        # 슬립 복귀 직후에는 요청이 멈췄다 재개되며 가짜 스파이크가 흔하다 —
+        # 즉시 기록하지 않고 잠시 뒤 새 handshake 로 1회 재측정한다.
+        # 재측정이 실패하면(네트워크 미복구 등) 스파이크를 반증하지 못한 것이므로
+        # 원래대로 중단한다 — 이후 정상 사이클이 이슈를 자동 해소한다.
+        retry_skew: float | None = None
+        try:
+            sleep(CLOCK_SPIKE_RECHECK_SECONDS)
+            retry_skew = self._measure_skew(self.peer.handshake())
+        except Exception:  # noqa: BLE001 - 재측정 실패는 차단 유지로 흡수한다
+            retry_skew = None
+        if retry_skew is not None:
+            self.runtime.clock_skew_seconds = round(retry_skew, 3)
+            if retry_skew <= SYNC_CLOCK_SKEW_LIMIT_SECONDS:
+                logger.info(
+                    "clock spike ignored after recheck (%.1fs -> %.1fs)", skew, retry_skew
+                )
+                return
+            skew = retry_skew
+        raise SyncBlocked(
+            "clock",
+            f"시계 편차가 {skew:.1f}초로 허용치({SYNC_CLOCK_SKEW_LIMIT_SECONDS}초)를 넘었습니다. "
+            "시간 동기화 후 재개하세요.",
+            {"skewSeconds": skew, "limit": SYNC_CLOCK_SKEW_LIMIT_SECONDS},
+        )
+
+    @staticmethod
+    def _measure_skew(handshake: dict) -> float | None:
         server_time = parse_iso_utc(handshake.get("serverTimeUtc"))
         if server_time is None:
-            return
-        skew = abs((utcnow_naive() - server_time).total_seconds())
-        self.runtime.clock_skew_seconds = round(skew, 3)
-        if skew > SYNC_CLOCK_SKEW_LIMIT_SECONDS:
-            raise SyncBlocked(
-                "clock",
-                f"시계 편차가 {skew:.1f}초로 허용치({SYNC_CLOCK_SKEW_LIMIT_SECONDS}초)를 넘었습니다. "
-                "시간 동기화 후 재개하세요.",
-                {"skewSeconds": skew, "limit": SYNC_CLOCK_SKEW_LIMIT_SECONDS},
-            )
+            return None
+        return abs((utcnow_naive() - server_time).total_seconds())
+
+    @staticmethod
+    def _resolve_stale_gate_issues(cursor) -> None:
+        """게이트(스키마·시계·신원)를 모두 통과한 사이클 직후 호출한다.
+
+        같은 종류의 미해결 이슈가 남아 있다면 조건이 이미 정상으로 돌아온
+        낡은 기록이므로 자동 해소한다 — 안 하면 상태 표시가 "중단"에 머문다
+        (슬립 복귀 스파이크 뒤 실제로 겪은 문제).
+        """
+        stale = 0
+        for kind in ("clock", "identity", "schema"):
+            stale += resolve_issues(cursor, kind=kind)
+        if stale:
+            logger.info("resolved %d stale gate issue(s) after a healthy cycle", stale)
 
     def _check_identity(self, cursor, handshake: dict) -> None:
         """부분 적용 없이 중단 — 신원이 어긋난 채 적재되면 손으로 풀기 어렵다."""

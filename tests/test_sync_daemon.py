@@ -89,16 +89,53 @@ class SchemaHandshakeTests(unittest.TestCase):
         self.assertEqual(self.daemon.runtime.peer_schema_version, SCHEMA_VERSION)
 
 
+class _FakePeer:
+    """재측정 handshake 를 순서대로 돌려주는 페이크. 다 떨어지면 예외."""
+
+    def __init__(self, handshakes: list[dict]) -> None:
+        self._handshakes = list(handshakes)
+        self.calls = 0
+
+    def handshake(self) -> dict:
+        self.calls += 1
+        if not self._handshakes:
+            raise ConnectionError("peer unreachable")
+        return self._handshakes.pop(0)
+
+
 class ClockSkewTests(unittest.TestCase):
     def setUp(self) -> None:
         self.daemon = SyncDaemon(peer=SyncPeer("http://peer.example", "k", "s"))
+        # 스파이크 재측정 대기를 없애 테스트를 빠르게 유지한다.
+        self._original_recheck = sync_daemon_module.CLOCK_SPIKE_RECHECK_SECONDS
+        sync_daemon_module.CLOCK_SPIKE_RECHECK_SECONDS = 0
+
+    def tearDown(self) -> None:
+        sync_daemon_module.CLOCK_SPIKE_RECHECK_SECONDS = self._original_recheck
 
     def test_small_skew_passes(self) -> None:
         self.daemon._check_clock(_handshake())
         self.assertLess(self.daemon.runtime.clock_skew_seconds, 5)
 
-    def test_large_skew_blocks(self) -> None:
+    def test_large_skew_blocks_when_recheck_unreachable(self) -> None:
+        # 재측정 대상 peer 가 죽어 있으면 스파이크를 반증하지 못한 것 — 기존대로 중단.
         skewed = iso_utc(utcnow_naive() + timedelta(minutes=3))
+        with self.assertRaises(SyncBlocked) as caught:
+            self.daemon._check_clock(_handshake(serverTimeUtc=skewed))
+        self.assertEqual(caught.exception.kind, "clock")
+        self.assertGreater(caught.exception.detail["skewSeconds"], 5)
+
+    def test_sleep_wake_spike_is_ignored_after_normal_recheck(self) -> None:
+        # 슬립 복귀 스파이크: 첫 측정은 53초, 재측정은 정상 → 이슈 없이 통과해야 한다.
+        self.daemon.peer = _FakePeer([_handshake()])
+        skewed = iso_utc(utcnow_naive() + timedelta(seconds=53))
+        self.daemon._check_clock(_handshake(serverTimeUtc=skewed))
+        self.assertEqual(self.daemon.peer.calls, 1)
+        self.assertLess(self.daemon.runtime.clock_skew_seconds, 5)
+
+    def test_persistent_skew_still_blocks_after_recheck(self) -> None:
+        skewed = iso_utc(utcnow_naive() + timedelta(minutes=3))
+        self.daemon.peer = _FakePeer([_handshake(serverTimeUtc=skewed)])
         with self.assertRaises(SyncBlocked) as caught:
             self.daemon._check_clock(_handshake(serverTimeUtc=skewed))
         self.assertEqual(caught.exception.kind, "clock")
@@ -159,6 +196,39 @@ class IdentityPreflightTests(unittest.TestCase):
         self.assertEqual(len(issues), 1)
         self.assertIsNone(issues[0]["resolved_at"])
         self.assertIn("stale-local-account", issues[0]["detail"])
+
+
+@unittest.skipUnless(REACHABLE, f"MySQL scratch DB unavailable ({DB_CONFIG['database']})")
+class StaleGateIssueResolutionTests(unittest.TestCase):
+    """정상 사이클 직후 낡은 게이트 이슈(clock/identity/schema)가 자동 해소되는지."""
+
+    def setUp(self) -> None:
+        truncate_scratch_tables()
+
+    def test_healthy_cycle_resolves_stale_gate_issues(self) -> None:
+        from src.services.sync_store import list_issues, record_issue
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                record_issue(cursor, "clock", detail={"message": "stale spike"})
+                record_issue(cursor, "identity", detail={"message": "stale identity"})
+                record_issue(
+                    cursor,
+                    "duplicate_memo",
+                    ref_table="memos",
+                    ref_id="m1",
+                    detail={"message": "사용자가 직접 정리해야 하는 이슈"},
+                )
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                SyncDaemon._resolve_stale_gate_issues(cursor)
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                unresolved = [i["kind"] for i in list_issues(cursor)]
+        # 게이트 이슈만 해소되고, 사용자 판단이 필요한 중복 이슈는 남아야 한다.
+        self.assertEqual(unresolved, ["duplicate_memo"])
 
 
 class PeerUrlTests(unittest.TestCase):
