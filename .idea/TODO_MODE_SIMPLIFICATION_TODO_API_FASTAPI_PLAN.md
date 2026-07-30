@@ -1,5 +1,5 @@
 ---
-status: PREPARED
+status: IN_PROGRESS
 summary: "TODO_MODE(dev/local/prod) 프리셋을 config 에 도입 — env 다이어트, 명시값>프리셋 우선순위, 기동 시 preflight 검증."
 ---
 
