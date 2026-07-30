@@ -30,6 +30,12 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/docs', timeout=4)" || exit 1
 
+# 빌드된 소스의 git ref. todoctl 이 prod-local 이미지를 만들 때 주입하고 `todoctl status` 가 읽는다.
+# 마지막에 둬서 ref 가 바뀌어도 위 레이어 캐시를 깨지 않는다. 미주입 시 빈 값.
+ARG TODO_BUILD_REF=""
+ENV TODO_BUILD_REF=${TODO_BUILD_REF}
+LABEL org.opencontainers.image.revision=${TODO_BUILD_REF}
+
 USER app
 
 CMD ["uvicorn", "src.__main__:app", "--host", "0.0.0.0", "--port", "8000"]
