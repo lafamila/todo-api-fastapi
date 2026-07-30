@@ -1,5 +1,4 @@
 import pymysql
-import os
 from dotenv import load_dotenv
 from contextlib import contextmanager
 
@@ -8,14 +7,36 @@ try:
 except ImportError:  # pragma: no cover
     from sync_schema import SYNC_TABLE_ORDER, declared_tables
 
+# 접속값은 `config.py` 가 확정한다 — `TODO_MODE` 프리셋(dev→teddynote_dev,
+# local→teddynote, prod→teddy-mysql)이 여기까지 닿아야 하기 때문이다.
+# `TODO_MODE` 미설정이면 예전과 동일한 `os.getenv` 결과가 그대로 들어온다.
+try:
+    from ..config import (
+        DB_HOST,
+        DB_NAME,
+        DB_PASSWORD,
+        DB_PORT,
+        DB_USER,
+        TODO_SESSION_DB_PERSISTENCE,
+    )
+except ImportError:  # pragma: no cover
+    from config import (
+        DB_HOST,
+        DB_NAME,
+        DB_PASSWORD,
+        DB_PORT,
+        DB_USER,
+        TODO_SESSION_DB_PERSISTENCE,
+    )
+
 load_dotenv()
 
 DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "localhost"),
-    "port": int(os.getenv("DB_PORT", 3306)),
-    "user": os.getenv("DB_USER", "root"),
-    "password": os.getenv("DB_PASSWORD", ""),
-    "database": os.getenv("DB_NAME", "todo"),
+    "host": DB_HOST,
+    "port": DB_PORT,
+    "user": DB_USER,
+    "password": DB_PASSWORD,
+    "database": DB_NAME,
     "charset": "utf8mb4",
     "cursorclass": pymysql.cursors.DictCursor,
 }
@@ -315,8 +336,8 @@ def init_db():
 
             _init_sync_schema(cursor)
 
-            # 세션 DB 영속화는 로컬(노트북) 전용 opt-in — 기본값(prod)에서는 테이블도 만들지 않는다.
-            if os.getenv("TODO_SESSION_DB_PERSISTENCE", "").strip().lower() in {"1", "true", "yes", "on"}:
+            # 세션 DB 영속화는 local 모드 전용 opt-in — 기본값(dev/prod)에서는 테이블도 만들지 않는다.
+            if TODO_SESSION_DB_PERSISTENCE:
                 ensure_session_table(cursor)
 
             connection.commit()

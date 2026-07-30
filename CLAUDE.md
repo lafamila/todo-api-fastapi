@@ -34,7 +34,8 @@ FastAPI backend for todo/project/memo/daily-task/article data. Raw SQL via PyMyS
 ```
 src/
 ├── __main__.py           # FastAPI app 생성(lifespan), CORS, 라우터 등록, Socket.IO ASGI wrap
-├── config.py             # .env 로딩 — DB_*, AUTH_*, TODO_*, LIVEKIT_* 설정값
+├── config.py             # TODO_MODE 프리셋 + .env — DB_*, AUTH_*, TODO_*, SYNC_*, LIVEKIT_* 확정
+├── preflight.py          # TODO_MODE 기동 검증 (필수 비밀·URL 형식·값 오염·역할 정합성)
 ├── auth_utils.py         # 토큰/권한 유틸
 ├── token_verifier.py     # auth-api-nest JWKS 검증
 ├── timeutil.py           # 시간대 명시 유틸 (원칙 8) — UTC 판정값 / Asia/Seoul 표시값 분리
@@ -58,6 +59,7 @@ scripts/
                            # + mirror 모드로 부트스트랩 적재(--wipe-daily-tasks/--sync-applying)
 tests/
 ├── scratch_db.py         # 스크래치 DB 가드 — 실사용 DB 를 지우려는 테스트를 거부한다
+├── test_mode_presets.py  # TODO_MODE 프리셋 매트릭스·우선순위·preflight (DB 불필요)
 ├── test_sync_schema.py   # 화이트리스트·정규화·시간 유틸 (DB 불필요)
 ├── test_sync_apply.py    # 충돌/중복/의존성/트리거 (실제 MySQL 스크래치 DB)
 └── test_sync_daemon.py   # 스키마 handshake 3케이스 / 시계 편차 / 신원 불일치
@@ -81,10 +83,98 @@ This repo keeps only a read-only legacy export script until migration verificati
 | Add API endpoint | `src/routers/{domain}.py` | 라우터 모듈에 route + Pydantic request model 추가, `__main__.py` 에 등록 |
 | Change DB schema | `src/connectors/__init__.py` `init_db()` | DDL in raw SQL, auto-runs on startup |
 | DB connection | `src/connectors/__init__.py` `get_db_connection()` | Context manager with auto-commit/rollback |
-| Environment vars | `.env` / `.env.example` → `DB_*`, `AUTH_*`, `TODO_*`, `LIVEKIT_*`, `SYNC_*` | Loaded via `python-dotenv`; deploy 시 런타임 env 주입. `.env.example` 을 먼저 고친다 (원칙 7) |
+| Environment vars | `src/config.py` 프리셋 + `.env.example` | `TODO_MODE` 가 모드 프리셋을 정하고 env 에는 비밀만 남는다 (아래 TODO_MODE 섹션). `.env.example` 을 먼저 고친다 (원칙 7) |
+| 모드 파생값 확인 | `python -m src.config` | 확정된 설정을 JSON 으로 덤프 (비밀은 존재 여부만) |
 | 동기화 정책 변경 | `src/sync_schema.py` + `src/services/sync_apply.py` | 컬럼 추가 시 화이트리스트와 `SCHEMA_VERSION` 을 **함께** 올린다 |
 | 동기화 상태 진단 | `python -m src.sync_cli doctor` | 신원·스키마·커서·이슈·트리거를 한 번에 본다 |
 | Export legacy topic data | `scripts/export_topic_data.py` | Read-only JSON export for topic service import |
+
+## TODO_MODE (모드 프리셋)
+
+Root plan: `../.idea/TODO_MODE_SIMPLIFICATION_PLAN.md` · repo 실행 계획: `.idea/TODO_MODE_SIMPLIFICATION_TODO_API_FASTAPI_PLAN.md`
+
+한 레포가 **2×2 = 4모드**로 구동된다. 축은 직교한다:
+
+```
+TODO_MODE = {코드 신선도} - {위치}
+            dev  = 작업 중 신버전·핫리로드      local = sync 클라이언트
+            prod = 검증된 고정 이미지            prod  = sync 서버
+```
+
+**모드만 선언하면** URL·DB·sync 역할·플래그가 `src/config.py` 의 프리셋에서 파생되고,
+env 파일에는 **비밀값만** 남는다 (prod-local 기준 ~10줄).
+
+```
+파이프라인: dev 페어에서 개발·테스트 → git push → (NAS) prod-prod 배포 → (노트북) todoctl local update
+```
+
+| `TODO_MODE` | 정체 | DB | auth | sync 역할 |
+|---|---|---|---|---|
+| `dev-local` | 개발 페어의 클라 (api :20023 / web :30333) | `teddynote_dev_local` @ `host.docker.internal:33306` | 로컬 `:3032` | `client` → dev-prod |
+| `dev-prod` | 개발 페어의 서버 (api :20024 / web :30334) | `teddynote_dev_prod` @ `host.docker.internal:33306` | 로컬 `:3032` | `server` |
+| `prod-local` | 노트북 실사용 (api :20022 / web :3030) | `teddynote` @ `host.docker.internal:33306` | `auth.lafamila.xyz` | `client` → prod-prod |
+| `prod-prod` | NAS 배포판 — 진실의 원천 | `teddynote` @ `teddy-mysql:3306` | 공개 `auth.lafamila.xyz` / 내부 `auth-api-nest:3032` | `server` |
+| 미설정 | **레거시** — 예전 동작 그대로 | env 그대로 | env 그대로 | env 그대로 |
+
+**dev 는 항상 페어**다 — sync 가 1급 기능이라 개발 환경 자체가 클라↔서버 실토폴로지의
+축소판이다. "sync 꺼진 dev" 특수 모드는 **없다** (레거시와 테스트가 그 역할을 한다).
+dev-local 의 peer 는 compose 서비스 DNS `http://todo-api-dev-prod:8000` 이다.
+
+전체 프리셋 표(키 × 모드)는 `.env.example` 상단에 있고, 확정된 값은 `python -m src.config` 로
+덤프한다. `host.docker.internal` 은 **컨테이너 스택 기준**이다 — 호스트에서 직접
+uvicorn 을 띄우면 `DB_HOST=127.0.0.1` 처럼 명시 env 로 덮는다.
+
+### feature flags 축 (주의)
+
+prod 전용 표면(화면공유·게시·멤버초대) 숨김 판정은 **sync 역할이 아니라 신선도 축**이다:
+
+- `TODO_MODE` 설정 → **`prod-local` 만 숨김**. `dev-local` 도 sync client 이지만 dev 페어는
+  모든 기능을 테스트하는 곳이라 숨기면 안 된다. 역할 기준으로 판정하면 여기서 잘못 숨겨진다.
+- `TODO_MODE` 미설정(레거시) → 예전대로 `sync_role() == client` 로 판정. 지금 구동 중인
+  실사용 스택(:20022, `TODO_MODE` 없음)이 계속 숨겨져야 하기 때문이다.
+
+판정 함수는 `config.hides_prod_only_surfaces()` 다.
+
+### 우선순위
+
+**명시 env > 모드 프리셋 > 레거시 기본값.**
+
+- `TODO_MODE` 미설정이면 `_env()` 가 `os.getenv(name, default)` 를 그대로 호출한다 —
+  기존 `.env`/compose 조합은 **100% 동일하게** 동작한다 (하위호환이 루트 단계의 전제).
+- `TODO_MODE` 가 있으면 **빈 문자열 = 미지정**이다. compose 가 `SYNC_PEER_URL: ""` 로 비워 둔
+  키는 프리셋 값으로 채워진다. 프리셋을 이기려면 **비어 있지 않은** 값을 준다.
+- 빈값으로 역할을 표현하던 트릭(`SYNC_PEER_URL` 비움 = 서버)은 **모드가 대신한다**. 명시
+  `SYNC_PEER_URL` 이 비어 있지 않으면 여전히 이기지만, 그것이 모드의 역할을 뒤집으면
+  preflight 가 기동을 막는다 (prod 인데 client 로 뒤바뀌는 사고 방지).
+- 비밀값(`DB_PASSWORD`, `*_SECRET`, `*_KEY_ID`, `SYNC_ACCOUNT_ID`, `SYNC_ALLOWED_KEY_IDS`,
+  `LIVEKIT_API_*`)은 **프리셋에 없다** — 코드가 알아서도 안 되는 값이다.
+- `DB_*` 도 `config.py` 가 확정한다. `connectors` 는 더 이상 `os.getenv` 를 직접 읽지 않는다.
+
+### preflight (`src/preflight.py`)
+
+`TODO_MODE` 가 설정된 기동에서만 동작하고, 실패하면 `SystemExit` 로 즉시 멈춘다.
+레거시 기동에서는 **호출되지 않는다**.
+
+| 검사 | 내용 |
+|---|---|
+| 모드 오타 | `dev-local\|dev-prod\|prod-local\|prod-prod` 외 값 거부 (구 3모드 이름 `dev`/`local`/`prod` 포함) |
+| 필수 비밀 | 전 모드 공통 `DB_PASSWORD`·`TODO_OIDC_CLIENT_SECRET`·`SYNC_ACCOUNT_ID` / client(`*-local`) `+ SYNC_KEY_ID`·`SYNC_SECRET` / server(`*-prod`) `+ AUTH_SERVICE_KEY_ID`·`AUTH_SERVICE_SECRET`·`SYNC_ALLOWED_KEY_IDS` / `prod-local` 은 계획대로 `AUTH_SERVICE_*` 도 필수 |
+| 값 오염 | 값 안의 `공백+#` 를 전 키에서 거부 — **docker env-file 은 인라인 주석을 지원하지 않는다** (2026-07-29 prod 장애). 비밀이 아닌 키는 `#`·내부 공백 자체를 거부 |
+| URL 형식 | `urlsplit` 으로 scheme/host 확인 (`AUTH_*`, `TODO_OIDC_REDIRECT_URI`, `TODO_WEB_BASE_URL`, origins, 비어 있지 않은 `SYNC_PEER_URL`/`LIVEKIT_URL`) |
+| 역할 정합성 | 모드가 정한 역할(disabled/client/server)을 명시 env 가 뒤집었는지 |
+
+메시지는 문제를 **전부 모아** "어느 키가 · 왜 · 어떻게 고치는지" 한 줄씩 출력한다.
+
+### 비밀 파일 관례 (전부 untracked)
+
+| 파일 | 용도 |
+|---|---|
+| `.env` | 레거시/호스트 실행용 (기존 파일 — 그대로 동작) |
+| `.env.dev` | **dev 페어 공유** 비밀 (dev-local·dev-prod 양쪽 env_file). 로컬 auth 에서 온보딩한 sync credential 포함 |
+| `.env.local` | prod-local 비밀. **기존 `.env.sync-client` 를 흡수·폐기한다** |
+| NAS `.env` | prod-prod 비밀 |
+
+`.dockerignore` 가 `.env.*`(except `.env.example`)를 제외하므로 이미지에는 들어가지 않는다.
 
 ## DATABASE SCHEMA
 
@@ -164,6 +254,10 @@ NAS 원격을 **단일 진실**로 두고, 노트북 로컬 스택을 outbox 를
 | `false` | — | `disabled` | 아무것도 안 한다 (개발용 2번째 스택) |
 | `true` | 설정됨 | `client` | 데몬(push/pull/소켓 구독) 실행. 피어 API 는 **서빙하지 않는다** |
 | `true` | 비어 있음 | `server` | `/api/sync/*` 피어 API 서빙 + credential 검증 |
+
+`TODO_MODE` 를 쓰면 이 조합을 **모드의 위치 축이 정한다** (`*-local`→client, `*-prod`→server).
+`disabled` 은 레거시 기동에서만 나온다.
+위 표는 레거시 기동과 "명시 env 가 프리셋을 이길 때"의 판정 규칙으로 남는다.
 
 접속은 **언제나 노트북이 시작한다** (NAS→노트북 인바운드 없음).
 
@@ -307,24 +401,37 @@ NULL 이 섞였을 때만 한다.
 오프라인 백오프. 폴링을 남기는 이유: `change_log` 는 트리거가 채우므로 API 밖 변경(수동 SQL)까지
 잡히지만 소켓 알림은 API 레이어에서 나가므로 그런 변경에는 뜨지 않는다.
 
-### 2스택 로컬 실행
+### 로컬 스택 실행 (dev 페어 + prod-local)
+
+역할은 `TODO_MODE` 가 정한다 (비밀은 `.env.dev`/`.env.local`, 위 TODO_MODE 섹션 참조).
+호스트에서 직접 띄울 때는 컨테이너용 주소(`host.docker.internal`, compose DNS)를 덮는다:
 
 ```bash
-# 실사용(동기화 대상) — DB teddynote
-DB_NAME=teddynote SYNC_ENABLED=true SYNC_PEER_URL=https://todo.lafamila.xyz \
-  SYNC_KEY_ID=… SYNC_SECRET=… TODO_LOCAL_SESSION_ENABLED=true \
+# 실사용 (prod-local — sync client) — DB teddynote
+TODO_MODE=prod-local DB_HOST=127.0.0.1 \
   venv/bin/python -m uvicorn src.__main__:app --host 127.0.0.1 --port 20022
 
-# 개발(동기화 제외) — DB teddynote_dev. SYNC_PEER_URL 을 비우고 SYNC_ENABLED=false
-DB_NAME=teddynote_dev SYNC_ENABLED=false \
+# 개발 페어의 서버 (dev-prod) — DB teddynote_dev_prod. 먼저 띄운다
+TODO_MODE=dev-prod DB_HOST=127.0.0.1 AUTH_API_BASE_URL=http://localhost:3032 \
+  AUTH_JWKS_URL=http://localhost:3032/oauth/jwks \
+  venv/bin/python -m uvicorn src.__main__:app --host 127.0.0.1 --port 20024
+
+# 개발 페어의 클라 (dev-local) — DB teddynote_dev_local. peer 를 호스트 주소로 덮는다
+TODO_MODE=dev-local DB_HOST=127.0.0.1 AUTH_API_BASE_URL=http://localhost:3032 \
+  AUTH_JWKS_URL=http://localhost:3032/oauth/jwks \
+  SYNC_PEER_URL=http://127.0.0.1:20024 \
   venv/bin/python -m uvicorn src.__main__:app --host 127.0.0.1 --port 20023
 ```
+
+컨테이너 스택은 `../.scripts/todo/compose.yml` 이 담당한다 (거기서는 `SYNC_PEER_URL`
+프리셋인 compose DNS `http://todo-api-dev-prod:8000` 이 그대로 맞다). `TODO_MODE` 없이
+예전처럼 `SYNC_ENABLED`/`SYNC_PEER_URL` 을 직접 주는 방식도 그대로 동작한다 (레거시).
 
 ### 테스트
 
 ```bash
-venv/bin/python -m unittest tests.test_sync_schema tests.test_sync_apply \
-    tests.test_sync_daemon tests.test_session_auth tests.test_migrate_legacy_todo
+venv/bin/python -m pytest tests/ -q          # 전체
+venv/bin/python -m pytest tests/test_mode_presets.py -q   # TODO_MODE 프리셋·preflight (DB 불필요)
 ```
 
 `tests/test_sync_apply.py` / `tests/test_sync_daemon.py` 는 **실제 MySQL 스크래치 DB**
