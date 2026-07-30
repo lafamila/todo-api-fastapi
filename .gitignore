@@ -132,8 +132,6 @@ celerybeat.pid
 # TODO_MODE 별 비밀 파일 (모드 선언 + 비밀값만) — 절대 커밋 금지
 .env.dev
 .env.local
-# 폐기 예정: .env.local 로 흡수한다 (기존 실사용 스택 비밀 오버라이드)
-.env.sync-client
 .venv
 env/
 venv/
