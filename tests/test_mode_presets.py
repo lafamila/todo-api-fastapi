@@ -189,8 +189,8 @@ class ModePresetMatrixTests(unittest.TestCase):
                 ),
             },
         )
-        # dev 페어는 모든 기능을 테스트하는 곳 — client 역할이어도 숨기지 않는다.
-        self.assertEqual(snapshot["featureFlags"], ALL_SHOWN)
+        # dev-local 은 prod-local 의 거울 — 숨김 UX 까지 동일 (2026-07-31 사용자 확정).
+        self.assertEqual(snapshot["featureFlags"], ALL_HIDDEN)
 
     def test_dev_prod_matches_contract(self) -> None:
         snapshot = _snapshot("dev-prod")
@@ -360,21 +360,25 @@ class SyncRoleDerivationTests(unittest.TestCase):
 
 
 class FeatureFlagAxisTests(unittest.TestCase):
-    """숨김 판정 축: 모드가 있으면 신선도(prod-local 만), 없으면 레거시 sync 역할."""
+    """숨김 판정 축: 위치 — `*-local` 은 숨기고 `*-prod` 는 노출 (레거시는 sync 역할)."""
 
-    def test_only_prod_local_hides(self) -> None:
+    def test_local_side_hides_prod_side_shows(self) -> None:
         for mode in ALL_MODES:
             with self.subTest(mode=mode):
                 flags = _snapshot(mode)["featureFlags"]
                 self.assertEqual(
-                    flags, ALL_HIDDEN if mode == "prod-local" else ALL_SHOWN
+                    flags,
+                    ALL_HIDDEN if mode.endswith("-local") else ALL_SHOWN,
                 )
 
-    def test_dev_local_is_client_but_still_shows_everything(self) -> None:
-        """역할 기준으로 판정하면 여기서 잘못 숨겨진다 — 축 변경의 핵심 회귀 지점."""
+    def test_dev_local_mirrors_prod_local_hiding(self) -> None:
+        """dev-local 은 prod-local 의 거울 — 숨김 UX 까지 동일해야 한다 (2026-07-31 사용자 확정).
+
+        숨겨진 기능(화면공유·게시·멤버초대)의 개발·테스트는 dev-prod web 에서 한다.
+        """
         snapshot = _snapshot("dev-local")
         self.assertEqual(snapshot["syncRole"], "client")
-        self.assertEqual(snapshot["featureFlags"], ALL_SHOWN)
+        self.assertEqual(snapshot["featureFlags"], ALL_HIDDEN)
 
     def test_legacy_client_still_hides(self) -> None:
         """구동 중인 실사용 스택(:20022, TODO_MODE 미설정, role=client) 보호."""

@@ -126,12 +126,13 @@ uvicorn 을 띄우면 `DB_HOST=127.0.0.1` 처럼 명시 env 로 덮는다.
 
 ### feature flags 축 (주의)
 
-prod 전용 표면(화면공유·게시·멤버초대) 숨김 판정은 **sync 역할이 아니라 신선도 축**이다:
+prod 전용 표면(화면공유·게시·멤버초대) 숨김 판정 축은 **위치**다 (2026-07-31 사용자 확정):
 
-- `TODO_MODE` 설정 → **`prod-local` 만 숨김**. `dev-local` 도 sync client 이지만 dev 페어는
-  모든 기능을 테스트하는 곳이라 숨기면 안 된다. 역할 기준으로 판정하면 여기서 잘못 숨겨진다.
-- `TODO_MODE` 미설정(레거시) → 예전대로 `sync_role() == client` 로 판정. 지금 구동 중인
-  실사용 스택(:20022, `TODO_MODE` 없음)이 계속 숨겨져야 하기 때문이다.
+- `TODO_MODE` 설정 → **`*-local`(dev-local·prod-local) 숨김, `*-prod` 노출**. dev-local 은
+  prod-local 의 거울이라 숨김 UX 까지 동일해야 하며, 숨겨진 기능의 개발·테스트는
+  dev-prod web(:30334)에서 한다.
+- `TODO_MODE` 미설정(레거시) → 예전대로 `sync_role() == client` 로 판정 — 위치 축과
+  사실상 같은 판정이다.
 
 판정 함수는 `config.hides_prod_only_surfaces()` 다.
 

@@ -195,8 +195,10 @@ MODE_PRESETS: dict[str, dict[str, str]] = {
     "prod-prod": {**_COMMON_PRESET, **_PROD_PROD_PRESET},
 }
 
-# 신선도 축이 `prod-local` 인 모드만 prod 전용 표면을 숨긴다 (feature_flags 참조).
-MODE_HIDES_PROD_ONLY_SURFACES = "prod-local"
+# 위치 축이 `*-local`(클라이언트 측)인 모드가 prod 전용 표면을 숨긴다 (feature_flags 참조).
+# dev-local 은 prod-local 의 거울이므로 함께 숨긴다 (2026-07-31 사용자 확정 — 숨김 UX 자체를
+# dev 페어에서 그대로 확인하기 위함. 숨겨진 기능의 테스트는 dev-prod web 에서 한다).
+MODES_HIDING_PROD_ONLY_SURFACES = ("dev-local", "prod-local")
 
 # 프리셋이 관리하는 키 전체 (루트 compose/todoctl 이 "이 키들은 env 에서 뺄 수 있다"를
 # 판단하는 근거).
@@ -375,17 +377,13 @@ def sync_role() -> str:
 def hides_prod_only_surfaces() -> bool:
     """prod 전용 표면을 숨기는 스택인가.
 
-    판정 축이 모드 유무로 갈린다:
-
-    - **`TODO_MODE` 설정**: 숨김은 sync 역할이 아니라 **신선도 축**이 정한다 —
-      `prod-local` 만 숨기고 `dev-local`·`dev-prod`·`prod-prod` 는 전부 노출한다.
-      `dev-local` 도 sync client 이지만, dev 페어는 **모든 기능을 테스트하는 곳**이라
-      숨기면 안 된다 (역할 기준으로 판정하면 여기서 잘못 숨겨진다).
-    - **미설정(레거시)**: 예전 그대로 `sync_role() == client` 로 판정한다.
-      지금 구동 중인 실사용 스택(:20022, `TODO_MODE` 없음)이 계속 숨겨져야 한다.
+    숨김 축은 **위치**다: `*-local`(클라이언트 측)은 숨기고 `*-prod`(서버 측)는 노출한다.
+    dev-local 은 prod-local 의 거울이라 같은 숨김 UX 를 보여야 하고(2026-07-31 사용자 확정),
+    숨겨진 기능(화면공유·게시·멤버초대)의 개발·테스트는 dev-prod web(:30334)에서 한다.
+    미설정(레거시)은 예전 그대로 `sync_role() == client` — 위치 축과 사실상 같은 판정이다.
     """
     if TODO_MODE:
-        return TODO_MODE == MODE_HIDES_PROD_ONLY_SURFACES
+        return TODO_MODE in MODES_HIDING_PROD_ONLY_SURFACES
     return sync_role() == SYNC_ROLE_CLIENT
 
 
