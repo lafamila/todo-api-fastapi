@@ -1,6 +1,6 @@
 ---
 status: IN_PROGRESS
-summary: "TODO_MODE(dev/local/prod) 프리셋을 config 에 도입 — env 다이어트, 명시값>프리셋 우선순위, 기동 시 preflight 검증."
+summary: "TODO_MODE 2×2(dev-local/dev-prod/prod-local/prod-prod) 프리셋을 config 에 도입 — env 다이어트, 명시값>프리셋 우선순위, 기동 시 preflight 검증."
 ---
 
 # TODO MODE SIMPLIFICATION — todo-api-fastapi execution plan
@@ -26,7 +26,7 @@ Canonical orchestration plan:
 ## Work Items
 
 1. **`src/config.py` 재구성**
-   - `TODO_MODE = os.getenv("TODO_MODE", "").strip().lower()` — 값: `dev|local|prod|""(레거시)`.
+   - `TODO_MODE = os.getenv("TODO_MODE", "").strip().lower()` — 값: `dev-local|dev-prod|prod-local|prod-prod|""(레거시)`. 프리셋 정답지는 root plan 의 2×2 env 계약 표 (dev 페어는 scratch DB·로컬 auth·상호 sync, dev-prod 신규 포트 :20024/:30334, 모드별 세션 쿠키 이름 분리 포함).
    - 모드별 프리셋 dict 정의: AUTH_ISSUER_URL/AUTH_PUBLIC_BASE_URL/AUTH_API_BASE_URL/AUTH_JWKS_URL, TODO_ALLOWED_ORIGINS/TODO_OIDC_REDIRECT_URI/TODO_WEB_BASE_URL/쿠키 설정, DB_HOST/DB_PORT/DB_NAME, SYNC_ENABLED/SYNC_PEER_URL/SYNC_CLIENT_ID/폴링·디바운스·백오프 등 SYNC 수치 전부, TODO_LOCAL_SESSION_ENABLED, TODO_SESSION_DB_PERSISTENCE, LIVEKIT_URL.
    - **우선순위: 명시 env > 모드 프리셋 > 기존 하드코딩 기본값.** `TODO_MODE` 미설정(레거시)이면 현재와 100% 동일하게 동작해야 한다.
    - 헬퍼 예: `def _mode_default(name, presets): env = os.getenv(name); return env if env not in (None, "") else presets.get(TODO_MODE, 기존기본)` — 단, 빈 문자열을 의미 있게 쓰는 키(`SYNC_PEER_URL` 서버 역할)는 명시 규칙을 문서화하고 프리셋으로 흡수한다 (모드가 역할을 정하므로 빈값 트릭이 필요 없어진다).
@@ -36,17 +36,19 @@ Canonical orchestration plan:
    - 실패 메시지는 "어느 키가, 왜, 어떻게 고치는지" 1줄씩.
 3. **`.env.example` 재작성** — 3모드 각각의 최소 형태(모드 선언 + 비밀만)를 예시로. `.env.local`/`.env.dev` 파일 관례와 `.env.sync-client` 폐기 예고를 명시. `.gitignore` 에 `.env.local`/`.env.dev` 추가.
 4. **테스트** (`tests/test_mode_presets.py`)
-   - 모드 매트릭스: 세 모드 각각에서 파생값이 root plan 의 env 계약 표와 일치.
+   - 모드 매트릭스: **네 모드** 각각에서 파생값이 root plan 의 env 계약 표와 일치.
    - 우선순위: 명시 env 가 프리셋을 이긴다 / `TODO_MODE` 미설정 시 레거시 동작 불변.
    - preflight: 필수 누락·URL 형식 오류·`#` 혼입·모드 오타 각각 명확히 거부.
-   - sync 역할 파생: dev→disabled, local→client, prod→server (`sync_role()`·`feature_flags()` 연동 확인).
+   - sync 역할 파생: dev-local·prod-local→client, dev-prod·prod-prod→server (`sync_role()` 연동).
+   - **feature flags 축 변경**: TODO_MODE 설정 시 `prod-local` 만 숨김·나머지 전부 표시. 레거시(미설정)는 기존 sync_role==client 숨김 유지 (현재 구동 중인 실사용 스택 보호).
 5. **문서** — repo `CLAUDE.md` 에 TODO_MODE 계약(프리셋 표·우선순위·preflight·비밀 파일 관례) 기록, 기존 env 나열 부분 정리.
 
 ## Acceptance Criteria
 
 - `TODO_MODE` 미설정 + 기존 env 조합으로 전체 테스트 suite green (레거시 무변경 증명).
-- `TODO_MODE=local` + 비밀 6~8개만으로 앱이 기동하고 `sync_role()==client`, 프리셋 값들이 현재 compose 오버라이드와 동일.
-- `TODO_MODE=prod` 프리셋이 NAS 현재 값과 동일 (내부 auth URL·DB 호스트 포함).
+- `TODO_MODE=prod-local` + 비밀 6~8개만으로 앱이 기동하고 `sync_role()==client`, 프리셋 값들이 현재 compose `todo-api` 오버라이드와 동일.
+- `TODO_MODE=dev-local`/`dev-prod` 페어 프리셋이 root plan 표와 일치 (peer=compose DNS `todo-api-dev-prod:8000`, scratch DB 2종, 쿠키 이름 분리).
+- `TODO_MODE=prod-prod` 프리셋이 NAS 현재 값과 동일 (내부 auth URL·DB 호스트 포함).
 - preflight 실패 케이스가 기동을 막고 원인 키를 정확히 지목한다.
 - 신규 테스트 + 기존 전체 테스트 green. `python -m compileall src` 통과.
 
