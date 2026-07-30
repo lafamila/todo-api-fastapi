@@ -84,32 +84,23 @@ python __main__.py
 docker build -t todo-api-fastapi .
 ```
 
-로컬 Docker 개발은 workspace root의 단일 Compose가 API와 Web을 함께
-관리합니다.
+로컬 Docker 스택은 workspace root 의 `todoctl` 로 조작합니다 (`TODO_MODE`
+2×2 체계 — URL/DB/쿠키/sync 역할은 `src/config.py` 의 모드 프리셋이 결정하고,
+compose 는 모드 선언과 비밀 파일만 주입합니다. 상세: `CLAUDE.md` TODO_MODE 섹션).
 
 ```bash
 # Workspace root
-docker compose -f .scripts/todo/compose.yml up -d --build
-
-# 종료
-docker compose -f .scripts/todo/compose.yml down
+.scripts/todoctl status
+.scripts/todoctl up local          # prod-local (:20022/:3030) — 고정 이미지 실사용
+.scripts/todoctl up dev            # dev 페어 (:20023/:30333 ↔ :20024/:30334) — 핫리로드
+.scripts/todoctl local update      # origin/main → 이미지 재빌드 → prod-local 반영
+.scripts/todoctl down dev|local
 ```
 
-개발 API는 호스트의 `127.0.0.1:20022`에만 공개되고 소스 변경 시 reload 됩니다.
-개발 브라우저 origin과 로그인 후 복귀 주소는 `http://localhost:3030`입니다.
-컨테이너에서 호스트의 MariaDB(`33306`), auth(`3032`), LiveKit(`7880`)에 접근할
-때는 `host.docker.internal`을 사용하며 Linux Docker의 `host-gateway`도
-등록합니다. 브라우저 authorize URL과 JWT issuer는
-`AUTH_PUBLIC_BASE_URL=http://localhost:3032`,
-`AUTH_ISSUER_URL=http://localhost:3032`로 유지하고 server-to-server 요청과
-JWKS 조회만 `host.docker.internal`을 사용합니다. OIDC callback은 브라우저가
-접근할 수 있는 `http://localhost:20022/api/todo/session/callback`으로
-유지됩니다.
-
-통합 Compose는 이 레포의 `.env`를 런타임에만 읽습니다. 실제 비밀번호, OIDC
-client secret, service credential, LiveKit secret은 이미지나 Compose 파일에
-기록하지 마세요. MariaDB host port만 `TODO_DB_HOST_PORT`로 재정의할 수
-있습니다.
+비밀 파일은 이 레포의 `.env.local`(prod-local)·`.env.dev`(dev 페어 공유,
+로컬 auth 기준)이며 untracked 입니다. 최초 생성은 `todoctl setup local|dev`
+가 안내합니다. 실제 비밀번호, OIDC client secret, service credential,
+LiveKit secret 은 이미지나 Compose 파일에 기록하지 마세요.
 
 운영에서는 app Compose를 사용하지 않습니다. `/volume1/www` 아래에 두 레포와
 workspace `.scripts`가 있다고 가정하고 다음 스크립트가 pull → build → 기존
@@ -121,8 +112,9 @@ cd /volume1/www
 ./.scripts/deploy-todo-prod.sh
 ```
 
-API 운영 `.env`에서 같은 Docker network의 MySQL을 사용한다면
-`DB_HOST=teddy-mysql`, `DB_PORT=3306`으로 설정합니다.
+운영 `.env` 는 `TODO_MODE=prod-prod` 선언과 비밀값만 남기는 형태가 표준입니다
+(DB/URL/쿠키는 프리셋이 결정 — `DB_HOST=teddy-mysql` 포함). 기동 시 preflight 가
+누락·형식 오류를 즉시 거부합니다.
 
 ## 배포/연동 메모
 

@@ -1,5 +1,6 @@
 ---
-status: IN_PROGRESS
+status: COMPLETED
+completed_at: 2026-07-31
 summary: "TODO_MODE 2×2(dev-local/dev-prod/prod-local/prod-prod) 프리셋을 config 에 도입 — env 다이어트, 명시값>프리셋 우선순위, 기동 시 preflight 검증."
 ---
 
