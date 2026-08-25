@@ -134,6 +134,9 @@ prod 전용 표면(화면공유·게시·멤버초대) 숨김 판정 축은 **�
 - `TODO_MODE` 미설정(레거시) → 예전대로 `sync_role() == client` 로 판정 — 위치 축과
   사실상 같은 판정이다.
 
+반대로 `memoVersionHistory`는 개인 복제본 탐색 기능이라 **`*-local`에서만 true**다.
+버전 조회 API 자체는 충돌 해소에도 쓰이므로 모든 모드에 유지하고, 일반 버전 선택 UI만 이 플래그로 숨긴다.
+
 판정 함수는 `config.hides_prod_only_surfaces()` 다.
 
 ### 우선순위
@@ -464,7 +467,7 @@ import 순서에 의존하지 말고 반드시 `use_scratch_database()` 를 쓴�
 |----------|--------|--------|
 | Auth/session | `routers/auth.py` | `POST /api/session/oidc/start`, `POST /api/session/logout`, `GET /api/session/me`, `POST /api/session/local`(오프라인 로그인), `GET /api/session/local/identity`, `POST /api/session/service-application`, `GET /api/users/search`, `POST /api/livekit/token` |
 | Projects | `routers/projects.py` | `GET/POST /api/projects`, `DELETE /api/projects/{id}`(soft), `POST /api/projects/{id}/verify`, 병합 `POST /api/projects/{loserId}/merge-into/{winnerId}`, 멤버 관리 `GET/POST /api/projects/{id}/members`, `DELETE /api/projects/{id}/members/{userId}`(soft) |
-| Memos | `routers/memos.py` | `GET /api/projects/{id}/memos`, `POST /api/memos`, `GET/PUT/DELETE /api/memos/{id}`, `POST /api/memos/bulk-delete`, 버전 `GET /api/memos/{id}/versions[/{v}]`, 병합 `POST /api/memos/{loserId}/merge-into/{winnerId}` |
+| Memos | `routers/memos.py` | `GET /api/projects/{id}/memos`, `POST /api/memos`, `GET/PUT/DELETE /api/memos/{id}`, `POST /api/memos/bulk-delete`, 버전 `GET /api/memos/{id}/versions[/{v}]` (`?includeContent=false`는 목록 metadata만), 병합 `POST /api/memos/{loserId}/merge-into/{winnerId}` |
 | Sync | `routers/sync.py` | 피어: `handshake`·`changes`·`push`·`locks/*`·`merge/*` (service credential) / UI: `status`·`issues`·`issues/resolve`·`pause`·`trigger` (세션) |
 | Articles | `routers/articles.py` | `POST/GET /api/articles`, `GET /api/articles/boards/{slug}`, `GET/DELETE /api/articles/{id}`, `GET /api/memos/{id}/article` |
 | Daily tasks | `routers/daily_tasks.py` | `/api/daily-tasks` prefix — `POST/GET/PUT/DELETE .../types[/{id}]`, `POST .../complete`, `DELETE .../complete/{typeId}/{date}`, `GET .../calendar[/{date}]` |

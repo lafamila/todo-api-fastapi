@@ -57,7 +57,7 @@ async def session_logout(request: Request, response: Response):
 async def session_me(request: Request):
     """현재 todo 세션 사용자를 반환한다 (오프라인 세션이면 `offline: true`).
 
-    `features` 는 스택 성격(sync 역할)에 따라 웹이 숨길 prod 전용 표면 목록이다.
+    `features` 는 위치 축에 따라 웹이 노출할 prod/local 전용 표면 목록이다.
     """
     me = await get_session_service().get_user(request)
     return {**me, "features": feature_flags()}

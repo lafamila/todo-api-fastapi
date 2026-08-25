@@ -53,8 +53,18 @@ DUMMY_SECRETS = {
     "SYNC_ALLOWED_KEY_IDS": "laptop-key",
 }
 
-ALL_SHOWN = {"screenShare": True, "articles": True, "memberInvite": True}
-ALL_HIDDEN = {"screenShare": False, "articles": False, "memberInvite": False}
+LOCAL_FEATURES = {
+    "screenShare": False,
+    "articles": False,
+    "memberInvite": False,
+    "memoVersionHistory": True,
+}
+PROD_FEATURES = {
+    "screenShare": True,
+    "articles": True,
+    "memberInvite": True,
+    "memoVersionHistory": False,
+}
 
 
 def _managed_keys() -> set[str]:
@@ -190,7 +200,7 @@ class ModePresetMatrixTests(unittest.TestCase):
             },
         )
         # dev-local 은 prod-local 의 거울 — 숨김 UX 까지 동일 (2026-07-31 사용자 확정).
-        self.assertEqual(snapshot["featureFlags"], ALL_HIDDEN)
+        self.assertEqual(snapshot["featureFlags"], LOCAL_FEATURES)
 
     def test_dev_prod_matches_contract(self) -> None:
         snapshot = _snapshot("dev-prod")
@@ -226,7 +236,7 @@ class ModePresetMatrixTests(unittest.TestCase):
                 ),
             },
         )
-        self.assertEqual(snapshot["featureFlags"], ALL_SHOWN)
+        self.assertEqual(snapshot["featureFlags"], PROD_FEATURES)
 
     def test_prod_local_matches_compose_todo_api_block(self) -> None:
         snapshot = _snapshot("prod-local")
@@ -265,8 +275,8 @@ class ModePresetMatrixTests(unittest.TestCase):
                 ),
             },
         )
-        # 단일 사용자 오프라인 복제본 — prod 전용 표면을 숨기는 **유일한** 모드다.
-        self.assertEqual(snapshot["featureFlags"], ALL_HIDDEN)
+        # 단일 사용자 오프라인 복제본 — prod 전용 표면은 숨기고 로컬 버전 기록은 노출한다.
+        self.assertEqual(snapshot["featureFlags"], LOCAL_FEATURES)
 
     def test_prod_prod_matches_root_plan_contract(self) -> None:
         snapshot = _snapshot("prod-prod")
@@ -302,7 +312,7 @@ class ModePresetMatrixTests(unittest.TestCase):
                 ),
             },
         )
-        self.assertEqual(snapshot["featureFlags"], ALL_SHOWN)
+        self.assertEqual(snapshot["featureFlags"], PROD_FEATURES)
 
     def test_session_cookie_names_are_unique_per_dev_mode(self) -> None:
         """localhost 는 포트가 달라도 쿠키를 공유한다 — 페어가 서로 로그인을 덮으면 안 된다."""
@@ -360,7 +370,7 @@ class SyncRoleDerivationTests(unittest.TestCase):
 
 
 class FeatureFlagAxisTests(unittest.TestCase):
-    """숨김 판정 축: 위치 — `*-local` 은 숨기고 `*-prod` 는 노출 (레거시는 sync 역할)."""
+    """표면 판정 축: 위치 — `*-local` 과 `*-prod` 기능 묶음이 서로 다르다."""
 
     def test_local_side_hides_prod_side_shows(self) -> None:
         for mode in ALL_MODES:
@@ -368,7 +378,7 @@ class FeatureFlagAxisTests(unittest.TestCase):
                 flags = _snapshot(mode)["featureFlags"]
                 self.assertEqual(
                     flags,
-                    ALL_HIDDEN if mode.endswith("-local") else ALL_SHOWN,
+                    LOCAL_FEATURES if mode.endswith("-local") else PROD_FEATURES,
                 )
 
     def test_dev_local_mirrors_prod_local_hiding(self) -> None:
@@ -378,7 +388,7 @@ class FeatureFlagAxisTests(unittest.TestCase):
         """
         snapshot = _snapshot("dev-local")
         self.assertEqual(snapshot["syncRole"], "client")
-        self.assertEqual(snapshot["featureFlags"], ALL_HIDDEN)
+        self.assertEqual(snapshot["featureFlags"], LOCAL_FEATURES)
 
     def test_legacy_client_still_hides(self) -> None:
         """구동 중인 실사용 스택(:20022, TODO_MODE 미설정, role=client) 보호."""
@@ -402,7 +412,7 @@ class FeatureFlagAxisTests(unittest.TestCase):
         snapshot = json.loads(result.stdout)
         self.assertEqual(snapshot["TODO_MODE"], "(legacy)")
         self.assertEqual(snapshot["syncRole"], "client")
-        self.assertEqual(snapshot["featureFlags"], ALL_HIDDEN)
+        self.assertEqual(snapshot["featureFlags"], LOCAL_FEATURES)
 
 
 class PrecedenceTests(unittest.TestCase):

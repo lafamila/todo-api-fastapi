@@ -1,6 +1,6 @@
-"""feature_flags — 스택 성격별 prod 전용 표면 노출 판정.
+"""feature_flags — 위치 축에 따른 prod/local 전용 표면 노출 판정.
 
-client(노트북 실사용) 만 숨기고, disabled(dev)·server(prod) 는 전부 노출한다.
+local(client)은 버전 기록만 노출하고 prod 전용 표면은 숨긴다.
 """
 
 import unittest
@@ -26,18 +26,40 @@ class FeatureFlagsTests(unittest.TestCase):
         flags = self._role(True, "https://todo.example")
         self.assertEqual(config.sync_role(), "client")
         self.assertEqual(
-            flags, {"screenShare": False, "articles": False, "memberInvite": False}
+            flags,
+            {
+                "screenShare": False,
+                "articles": False,
+                "memberInvite": False,
+                "memoVersionHistory": True,
+            },
         )
 
     def test_server_shows_everything(self) -> None:
         flags = self._role(True, "")
         self.assertEqual(config.sync_role(), "server")
-        self.assertTrue(all(flags.values()))
+        self.assertEqual(
+            flags,
+            {
+                "screenShare": True,
+                "articles": True,
+                "memberInvite": True,
+                "memoVersionHistory": False,
+            },
+        )
 
-    def test_disabled_dev_stack_shows_everything(self) -> None:
+    def test_disabled_legacy_stack_uses_prod_surfaces(self) -> None:
         flags = self._role(False, "")
         self.assertEqual(config.sync_role(), "disabled")
-        self.assertTrue(all(flags.values()))
+        self.assertEqual(
+            flags,
+            {
+                "screenShare": True,
+                "articles": True,
+                "memberInvite": True,
+                "memoVersionHistory": False,
+            },
+        )
 
 
 if __name__ == "__main__":

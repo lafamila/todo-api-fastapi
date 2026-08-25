@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
 try:
     from ..auth_utils import get_current_user, require_admin
@@ -55,6 +55,18 @@ def _serialize_version(version: dict) -> dict:
         "content": version["content"],
         "version": version["version"],
         # 충돌/병합으로 보존된 버전임을 알려 주는 표시 — `충돌 · 로컬 (07-29 14:02)`
+        "note": version.get("note"),
+        "createdAt": version["created_at"].isoformat(),
+        "updatedAtUtc": iso_utc(version.get("updated_at_utc")),
+    }
+
+
+def _serialize_version_summary(version: dict) -> dict:
+    """목록에는 큰 본문을 싣지 않는다 — 본문은 버전 선택 시 상세 API로 읽는다."""
+    return {
+        "id": version["id"],
+        "memoId": version["memo_id"],
+        "version": version["version"],
         "note": version.get("note"),
         "createdAt": version["created_at"].isoformat(),
         "updatedAtUtc": iso_utc(version.get("updated_at_utc")),
@@ -268,7 +280,11 @@ async def update_memo(
 
 
 @router.get("/memos/{memo_id}/versions")
-async def get_memo_versions(memo_id: str, user: dict = Depends(get_current_user)):
+async def get_memo_versions(
+    memo_id: str,
+    include_content: bool = Query(default=True, alias="includeContent"),
+    user: dict = Depends(get_current_user),
+):
     """메모의 버전 히스토리 조회 (충돌·병합 보존 버전은 `note` 로 구분된다)"""
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
@@ -283,16 +299,20 @@ async def get_memo_versions(memo_id: str, user: dict = Depends(get_current_user)
             if not check_project_membership(cursor, memo["project_id"], user):
                 raise HTTPException(status_code=403, detail="Access denied")
 
+            content_column = ", content" if include_content else ""
             cursor.execute(
-                """
-                SELECT id, memo_id, content, version, note, created_at, updated_at_utc
+                f"""
+                SELECT id, memo_id, version, note, created_at, updated_at_utc{content_column}
                 FROM memo_versions
                 WHERE memo_id = %s
                 ORDER BY version DESC
             """,
                 (memo_id,),
             )
-            return [_serialize_version(version) for version in cursor.fetchall()]
+            serializer = (
+                _serialize_version if include_content else _serialize_version_summary
+            )
+            return [serializer(version) for version in cursor.fetchall()]
 
 
 @router.get("/memos/{memo_id}/versions/{version}")

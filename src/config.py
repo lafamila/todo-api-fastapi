@@ -388,17 +388,19 @@ def hides_prod_only_surfaces() -> bool:
 
 
 def feature_flags() -> dict:
-    """웹에서 숨길 prod 전용 표면 (`/api/session/me` 로 내려간다).
+    """위치별 웹 표면 (`/api/session/me` 로 내려간다).
 
     노트북 실사용(prod-local) 스택은 단일 사용자 오프라인 복제본이다:
     - articles 게시: articles 는 동기화 제외 테이블 — 로컬에서 게시하면 로컬 DB 에만 남는다
     - 화면공유(LiveKit)·멤버 초대: 멀티유저 기능이라 무의미하다
+    - 메모 버전 기록: 개인 로컬 데이터 탐색용이므로 `*-local` 에서만 노출한다
     """
-    hidden = hides_prod_only_surfaces()
+    local_side = hides_prod_only_surfaces()
     return {
-        "screenShare": not hidden,
-        "articles": not hidden,
-        "memberInvite": not hidden,
+        "screenShare": not local_side,
+        "articles": not local_side,
+        "memberInvite": not local_side,
+        "memoVersionHistory": local_side,
     }
 
 
