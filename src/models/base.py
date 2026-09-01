@@ -18,6 +18,7 @@ class CreateMemoRequest(BaseModel):
 
 class UpdateMemoRequest(BaseModel):
     content: str
+    baseRevision: Optional[str] = None
 
 
 class VerifyPasswordRequest(BaseModel):
@@ -92,3 +93,4 @@ class Memo(BaseModel):
     status: int = 0
     createdAt: datetime
     updatedAt: datetime
+    revision: str

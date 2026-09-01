@@ -1,3 +1,6 @@
+import hashlib
+import json
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
 try:
@@ -34,6 +37,21 @@ MEMO_COLUMNS = (
 )
 
 
+def _memo_revision(memo: dict) -> str:
+    """Return an opaque, deterministic revision without adding DB state."""
+    canonical = json.dumps(
+        {
+            "content": memo["content"],
+            "id": memo["id"],
+            "updatedAtUtc": iso_utc(memo.get("updated_at_utc")),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _serialize_memo(memo: dict) -> dict:
     return {
         "id": memo["id"],
@@ -45,6 +63,7 @@ def _serialize_memo(memo: dict) -> dict:
         "createdAt": memo["created_at"].isoformat(),
         "updatedAt": memo["updated_at"].isoformat(),
         "updatedAtUtc": iso_utc(memo.get("updated_at_utc")),
+        "revision": _memo_revision(memo),
     }
 
 
@@ -168,17 +187,19 @@ async def create_memo(data: CreateMemoRequest, user: dict = Depends(get_current_
                 (memo_id, data.projectId, user["id"], data.title, "", 0, now, now, now_utc),
             )
 
-    return {
-        "id": memo_id,
-        "projectId": data.projectId,
-        "createdBy": user["id"],
-        "title": data.title,
-        "content": "",
-        "status": 0,
-        "createdAt": now.isoformat(),
-        "updatedAt": now.isoformat(),
-        "updatedAtUtc": iso_utc(now_utc),
-    }
+    return _serialize_memo(
+        {
+            "id": memo_id,
+            "project_id": data.projectId,
+            "created_by": user["id"],
+            "title": data.title,
+            "content": "",
+            "status": 0,
+            "created_at": now,
+            "updated_at": now,
+            "updated_at_utc": now_utc,
+        }
+    )
 
 
 @router.get("/memos/{memo_id}")
@@ -216,7 +237,8 @@ async def update_memo(
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT * FROM memos WHERE id = %s AND deleted_at IS NULL", (memo_id,)
+                "SELECT * FROM memos WHERE id = %s AND deleted_at IS NULL FOR UPDATE",
+                (memo_id,),
             )
             memo = cursor.fetchone()
 
@@ -227,6 +249,20 @@ async def update_memo(
                 raise HTTPException(status_code=403, detail="Access denied")
 
             _require_memo_write_lease(memo_id, user["id"], lease_token)
+
+            current_revision = _memo_revision(memo)
+            if (
+                data.baseRevision is not None
+                and data.baseRevision != current_revision
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "memo_content_conflict",
+                        "message": "Memo content changed after this edit was based on it.",
+                        "current": _serialize_memo(memo),
+                    },
+                )
 
             now = localnow_naive()
             now_utc = utcnow_naive()

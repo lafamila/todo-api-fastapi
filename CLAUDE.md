@@ -457,6 +457,12 @@ import 순서에 의존하지 말고 반드시 `use_scratch_database()` 를 쓴�
 - ~~`@app.on_event("startup")`~~ — **해결됨**: `lifespan` context manager 로 전환 완료. 새 코드에서 `on_event` 재도입 금지.
 - **No input sanitization** on f-string in `init_db()`: `f"CREATE DATABASE IF NOT EXISTS {DB_CONFIG['database']}"` (SQL injection risk if DB_NAME is user-controlled)
 - **Memo versioning** saves old content before update but **no version diffing** — stores full content copies
+- **Memo optimistic concurrency** — 현재 메모 응답은 `id`·`content`·`updated_at_utc`의
+  canonical SHA-256인 opaque `revision`을 포함한다. `PUT /api/memos/{id}`는 선택적
+  `baseRevision`을 받으며, 행을 `FOR UPDATE`로 잠근 뒤 현재 revision과 다르면 쓰기나 버전
+  생성 없이 `409 {code: memo_content_conflict, current: <Memo>}`를 반환한다. 생략은 구형
+  클라이언트와의 rolling compatibility를 위해 허용한다. revision을 해석하거나 생성 시각처럼
+  취급하지 말고, 마지막으로 읽은 값을 그대로 되돌려 보내야 한다.
 - **No pagination** on any list endpoint
 
 ## API ENDPOINTS
