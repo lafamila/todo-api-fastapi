@@ -49,6 +49,7 @@ src/
 ├── routers/              # APIRouter 모듈 — auth, projects, memos, articles, daily_tasks, sync
 └── services/             # session_auth(OIDC+오프라인 세션), realtime(Socket.IO), livekit,
                           # merge(중복 병합), lock_registry(락 단일 진실),
+                          # memo_search(프로젝트 현재 메모 BM25 순위·강조 문맥),
                           # sync_auth(credential 검증) · sync_store(change_log/state/issues) ·
                           # sync_apply(LWW·중복 정책) · sync_peer(원격 호출) ·
                           # sync_daemon(push/pull 루프) · sync_runtime(온라인 상태) · http_json
@@ -81,6 +82,7 @@ This repo keeps only a read-only legacy export script until migration verificati
 | Task | Location | Notes |
 |------|----------|-------|
 | Add API endpoint | `src/routers/{domain}.py` | 라우터 모듈에 route + Pydantic request model 추가, `__main__.py` 에 등록 |
+| Change project memo search | `src/services/memo_search.py` + `src/routers/memos.py` | 현재 `memos` 전체 코퍼스 BM25F 순위. `memo_versions`/삭제 행/브라우저 초안 제외. 최대 16 terms·동시 2건 |
 | Change DB schema | `src/connectors/__init__.py` `init_db()` | DDL in raw SQL, auto-runs on startup |
 | DB connection | `src/connectors/__init__.py` `get_db_connection()` | Context manager with auto-commit/rollback |
 | Environment vars | `src/config.py` 프리셋 + `.env.example` | `TODO_MODE` 가 모드 프리셋을 정하고 env 에는 비밀만 남는다 (아래 TODO_MODE 섹션). `.env.example` 을 먼저 고친다 (원칙 7) |

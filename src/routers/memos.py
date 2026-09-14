@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 
@@ -12,6 +13,7 @@ try:
         UpdateMemoRequest,
     )
     from ..services.merge import MergeError, run_merge
+    from ..services.memo_search import search_memos, validate_search_query
     from ..services.realtime import get_realtime_server
     from ..timeutil import iso_utc, localnow_naive, utcnow_naive
     from ..utils import can_manage_project, can_write_project, check_project_membership, generate_id
@@ -24,12 +26,25 @@ except ImportError:  # pragma: no cover
         UpdateMemoRequest,
     )
     from services.merge import MergeError, run_merge
+    from services.memo_search import search_memos, validate_search_query
     from services.realtime import get_realtime_server
     from timeutil import iso_utc, localnow_naive, utcnow_naive
     from utils import can_manage_project, can_write_project, check_project_membership, generate_id
 
 
 router = APIRouter(prefix="/api", tags=["memos"])
+
+_SEARCH_CAPACITY = asyncio.BoundedSemaphore(2)
+
+
+def _release_search_capacity(
+    capacity: asyncio.BoundedSemaphore, task: asyncio.Task
+) -> None:
+    capacity.release()
+    if not task.cancelled():
+        # Mark a worker exception as observed even if the HTTP request was
+        # cancelled while asyncio.shield kept the thread-backed task alive.
+        task.exception()
 
 MEMO_COLUMNS = (
     "id, project_id, created_by, title, content, status, "
@@ -124,6 +139,32 @@ def _require_memo_write_lease(
         )
 
 
+def _search_project_memos_sync(
+    project_id: str, query: str, limit: int, user: dict
+) -> dict:
+    """Load, authorize, and rank in a worker so large corpora never block ASGI."""
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            _require_live_project(cursor, project_id)
+
+            if not check_project_membership(cursor, project_id, user):
+                raise HTTPException(status_code=403, detail="Access denied")
+
+            # memos 자체가 최신 스냅샷이다. memo_versions 를 조인하지 않고 전체
+            # 현재 코퍼스를 가져온 뒤 ranking을 수행해야 limit 이전 문서도 경쟁한다.
+            cursor.execute(
+                """
+                SELECT id, title, content
+                FROM memos
+                WHERE project_id = %s AND deleted_at IS NULL
+                """,
+                (project_id,),
+            )
+            rows = cursor.fetchall()
+
+    return search_memos(rows, query, limit)
+
+
 @router.get("/projects/{project_id}/memos")
 async def get_project_memos(project_id: str, user: dict = Depends(get_current_user)):
     """특정 프로젝트의 메모 목록 조회"""
@@ -144,6 +185,43 @@ async def get_project_memos(project_id: str, user: dict = Depends(get_current_us
                 (project_id,),
             )
             return [_serialize_memo(memo) for memo in cursor.fetchall()]
+
+
+@router.get("/projects/{project_id}/memos/search")
+async def search_project_memos(
+    project_id: str,
+    q: str = Query(min_length=1, max_length=200),
+    limit: int = Query(default=20, ge=1, le=50),
+    user: dict = Depends(get_current_user),
+):
+    """현재 프로젝트의 저장된 최신 메모를 관련도순으로 검색한다."""
+    try:
+        validate_search_query(q)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if _SEARCH_CAPACITY.locked():
+        raise HTTPException(
+            status_code=429,
+            detail="검색 요청이 많습니다. 잠시 후 다시 시도해 주세요.",
+            headers={"Retry-After": "1"},
+        )
+
+    capacity = _SEARCH_CAPACITY
+    await capacity.acquire()
+    try:
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                _search_project_memos_sync, project_id, q, limit, user
+            )
+        )
+    except BaseException:
+        capacity.release()
+        raise
+    worker.add_done_callback(
+        lambda task: _release_search_capacity(capacity, task)
+    )
+    return await asyncio.shield(worker)
 
 
 @router.post("/memos", status_code=201)
