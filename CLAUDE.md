@@ -83,6 +83,7 @@ This repo keeps only a read-only legacy export script until migration verificati
 |------|----------|-------|
 | Add API endpoint | `src/routers/{domain}.py` | 라우터 모듈에 route + Pydantic request model 추가, `__main__.py` 에 등록 |
 | Change project memo search | `src/services/memo_search.py` + `src/routers/memos.py` | 현재 `memos` 전체 코퍼스 BM25F 순위. `memo_versions`/삭제 행/브라우저 초안 제외. 최대 16 terms·동시 2건 |
+| Change realtime memo access | `src/services/realtime.py` | `joinMemo`마다 읽기 권한을 재검증하며, 회수된 구독과 편집 lease를 즉시 정리한다 |
 | Change DB schema | `src/connectors/__init__.py` `init_db()` | DDL in raw SQL, auto-runs on startup |
 | DB connection | `src/connectors/__init__.py` `get_db_connection()` | Context manager with auto-commit/rollback |
 | Environment vars | `src/config.py` 프리셋 + `.env.example` | `TODO_MODE` 가 모드 프리셋을 정하고 env 에는 비밀만 남는다 (아래 TODO_MODE 섹션). `.env.example` 을 먼저 고친다 (원칙 7) |

@@ -150,24 +150,43 @@ class _Sio:
     def __init__(self) -> None:
         self.emits: list[tuple[str, dict, dict]] = []
         self.disconnects: list[str] = []
+        self.room_members: dict[str, set[str]] = defaultdict(set)
+        self.deliveries: list[tuple[str, set[str]]] = []
+        self.actions: list[str] = []
+        self.emit_failures: set[str] = set()
 
     async def emit(self, event: str, payload: dict, **kwargs) -> None:
+        self.actions.append(f"emit:{event}")
+        if event in self.emit_failures:
+            raise RuntimeError("socket already closed")
         self.emits.append((event, payload, kwargs))
+        recipients = set()
+        if kwargs.get("to"):
+            recipients.add(kwargs["to"])
+        elif kwargs.get("room"):
+            recipients.update(self.room_members[kwargs["room"]])
+        if kwargs.get("skip_sid"):
+            recipients.discard(kwargs["skip_sid"])
+        self.deliveries.append((event, recipients))
 
-    async def enter_room(self, *_args) -> None:
-        return None
+    async def enter_room(self, sid: str, room: str) -> None:
+        self.room_members[room].add(sid)
 
-    async def leave_room(self, *_args) -> None:
-        return None
+    async def leave_room(self, sid: str, room: str) -> None:
+        self.room_members[room].discard(sid)
 
     async def disconnect(self, sid: str) -> None:
+        self.actions.append(f"disconnect:{sid}")
         self.disconnects.append(sid)
+        for members in self.room_members.values():
+            members.discard(sid)
 
 
 class RealtimeDelegationTests(unittest.IsolatedAsyncioTestCase):
     def _server(self) -> realtime.MemoRealtimeServer:
         server = realtime.MemoRealtimeServer.__new__(realtime.MemoRealtimeServer)
         server.users = {"sid-1": {"user_id": "user-1", "display_name": "User"}}
+        server.rooms = defaultdict(set)
         server.socket_memos = defaultdict(set, {"sid-1": {"memo-1"}})
         server.socket_projects = defaultdict(set)
         server.socket_locks = defaultdict(set)
@@ -182,6 +201,137 @@ class RealtimeDelegationTests(unittest.IsolatedAsyncioTestCase):
         server.session_revalidation_tasks = {}
         server._can_access_memo = lambda *_args: True
         return server
+
+    async def test_revoked_reader_rejoin_removes_room_and_owned_lock(self) -> None:
+        server = self._server()
+        server.socket_memos["sid-1"].clear()
+
+        with patch.object(realtime, "runs_sync_daemon", return_value=False):
+            self.assertTrue(
+                await server._join_memo("sid-1", {"memoId": "memo-1"})
+            )
+            await server._acquire_lock("sid-1", "memo-1", renewal=False)
+
+            server._can_access_memo = lambda *_args: False
+            self.assertFalse(
+                await server._join_memo("sid-1", {"memoId": "memo-1"})
+            )
+
+        self.assertNotIn("sid-1", server.sio.room_members["memo:memo-1"])
+        self.assertNotIn("memo-1", server.rooms)
+        self.assertNotIn("memo-1", server.socket_memos["sid-1"])
+        self.assertNotIn("memo-1", server.socket_locks["sid-1"])
+        self.assertNotIn("memo-1", server.socket_lease_tokens["sid-1"])
+        self.assertIsNone(server.lock_registry.holder("memo-1"))
+        self.assertEqual(server.sio.emits[-1][0], "memoAccessDenied")
+
+        await server.sio.emit(
+            "memoContentUpdated",
+            {"memoId": "memo-1", "content": "future"},
+            room="memo:memo-1",
+        )
+        self.assertNotIn("sid-1", server.sio.deliveries[-1][1])
+
+    async def test_closed_revoked_socket_is_disconnected_when_denial_emit_fails(self) -> None:
+        server = self._server()
+        server.rooms["memo-1"].add("sid-1")
+        server.sio.room_members["memo:memo-1"].add("sid-1")
+        server.sio.emit_failures.add("memoAccessDenied")
+        server._can_access_memo = lambda *_args: False
+
+        async def failing_leave_room(_sid: str, _room: str) -> None:
+            raise RuntimeError("socket already closed")
+
+        server.sio.leave_room = failing_leave_room
+
+        with self.assertLogs(realtime.logger, level="ERROR"):
+            self.assertFalse(
+                await server._join_memo("sid-1", {"memoId": "memo-1"})
+            )
+
+        self.assertEqual(
+            server.sio.actions[-2:],
+            ["emit:memoAccessDenied", "disconnect:sid-1"],
+        )
+        self.assertEqual(server.sio.disconnects, ["sid-1"])
+        self.assertNotIn("sid-1", server.users)
+        self.assertNotIn("sid-1", server.sio.room_members["memo:memo-1"])
+
+    async def test_revoked_reader_cleanup_failure_still_emits_denial(self) -> None:
+        server = self._server()
+        server.rooms["memo-1"].add("sid-1")
+        server.sio.room_members["memo:memo-1"].add("sid-1")
+        server.socket_locks["sid-1"].add("memo-1")
+        server.socket_lease_tokens["sid-1"]["memo-1"] = (
+            "stale-token",
+            realtime.monotonic() + 60,
+        )
+        server._can_access_memo = lambda *_args: False
+
+        async def failing_leave(_sid: str, _memo_id: str) -> None:
+            raise RuntimeError("transport closed")
+
+        server._leave_memo = failing_leave
+
+        self.assertFalse(
+            await server._join_memo("sid-1", {"memoId": "memo-1"})
+        )
+
+        self.assertNotIn("memo-1", server.socket_memos["sid-1"])
+        self.assertNotIn("memo-1", server.socket_locks["sid-1"])
+        self.assertNotIn("memo-1", server.socket_lease_tokens["sid-1"])
+        self.assertNotIn("memo-1", server.rooms)
+        self.assertNotIn("sid-1", server.sio.room_members["memo:memo-1"])
+        self.assertEqual(server.sio.emits[-1][0], "memoAccessDenied")
+
+    async def test_double_room_eviction_failure_disconnects_after_denial(self) -> None:
+        server = self._server()
+        server.rooms["memo-1"].add("sid-1")
+        server.sio.room_members["memo:memo-1"].add("sid-1")
+        server._can_access_memo = lambda *_args: False
+
+        async def failing_leave_room(_sid: str, _room: str) -> None:
+            raise RuntimeError("manager unavailable")
+
+        server.sio.leave_room = failing_leave_room
+
+        with self.assertLogs(realtime.logger, level="ERROR"):
+            self.assertFalse(
+                await server._join_memo("sid-1", {"memoId": "memo-1"})
+            )
+
+        self.assertEqual(
+            server.sio.actions[-2:],
+            ["emit:memoAccessDenied", "disconnect:sid-1"],
+        )
+        self.assertEqual(server.sio.disconnects, ["sid-1"])
+        self.assertNotIn("sid-1", server.sio.room_members["memo:memo-1"])
+        self.assertNotIn("memo-1", server.socket_memos["sid-1"])
+        self.assertNotIn("memo-1", server.socket_locks["sid-1"])
+
+        await server.sio.emit(
+            "memoContentUpdated",
+            {"memoId": "memo-1", "content": "future"},
+            room="memo:memo-1",
+        )
+        self.assertNotIn("sid-1", server.sio.deliveries[-1][1])
+
+    async def test_write_denial_keeps_readable_memo_subscription(self) -> None:
+        server = self._server()
+        server.socket_memos["sid-1"].clear()
+
+        with patch.object(realtime, "runs_sync_daemon", return_value=False):
+            self.assertTrue(
+                await server._join_memo("sid-1", {"memoId": "memo-1"})
+            )
+            server._can_access_memo = lambda _memo, _user, write: not write
+            await server._acquire_lock("sid-1", "memo-1", renewal=False)
+
+        self.assertIn("sid-1", server.sio.room_members["memo:memo-1"])
+        self.assertIn("memo-1", server.rooms)
+        self.assertIn("memo-1", server.socket_memos["sid-1"])
+        self.assertNotIn("memo-1", server.socket_locks["sid-1"])
+        self.assertEqual(server.sio.emits[-1][0], "lockDenied")
 
     async def test_online_rejection_fails_closed_without_local_lock(self) -> None:
         server = self._server()

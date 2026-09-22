@@ -371,41 +371,7 @@ class MemoRealtimeServer:
 
         @self.sio.on("joinMemo")
         async def join_memo(sid, data):
-            memo_id = _get_id(data, "memoId")
-            user_info = self.users.get(sid)
-            if (
-                not memo_id
-                or not user_info
-                or not await asyncio.to_thread(
-                    self._can_access_memo, memo_id, user_info, False
-                )
-            ):
-                if memo_id:
-                    await self.sio.emit(
-                        "memoAccessDenied", {"memoId": memo_id}, to=sid
-                    )
-                return
-            room_name = f"memo:{memo_id}"
-            await self.sio.enter_room(sid, room_name)
-            self.rooms[memo_id].add(sid)
-            self.socket_memos[sid].add(memo_id)
-
-            lock_available = True
-            try:
-                lock = await self._resolve_lock_holder(memo_id)
-            except LockDelegationError:
-                lock = None
-                lock_available = False
-            await self.sio.emit(
-                "lockStatus",
-                {
-                    "memoId": memo_id,
-                    "lockedBy": lock["displayName"] if lock else None,
-                    "lockedByUserId": lock["userId"] if lock else None,
-                    "available": lock_available,
-                },
-                to=sid,
-            )
+            await self._join_memo(sid, data)
 
         @self.sio.on("leaveMemo")
         async def leave_memo(sid, data):
@@ -612,6 +578,110 @@ class MemoRealtimeServer:
         self.socket_memos[sid].discard(memo_id)
         if memo_id in self.socket_locks.get(sid, set()):
             await self._release_lock(sid, memo_id)
+
+    async def _join_memo(self, sid: str, data: dict | None) -> bool:
+        memo_id = _get_id(data, "memoId")
+        user_info = self.users.get(sid)
+        can_read = bool(
+            memo_id
+            and user_info
+            and await asyncio.to_thread(
+                self._can_access_memo, memo_id, user_info, False
+            )
+        )
+        if not can_read:
+            if memo_id:
+                disconnect_after_denial = False
+                if memo_id in self.socket_memos.get(sid, set()):
+                    disconnect_after_denial = await self._revoke_memo_access(
+                        sid, memo_id
+                    )
+                try:
+                    await self.sio.emit(
+                        "memoAccessDenied", {"memoId": memo_id}, to=sid
+                    )
+                except Exception:
+                    if not disconnect_after_denial:
+                        raise
+                    logger.debug(
+                        "revoked memo denial raced with closed socket: sid=%s memo=%s",
+                        sid,
+                        memo_id,
+                    )
+                finally:
+                    if disconnect_after_denial:
+                        # 룸 퇴장이 두 번 모두 실패하면 실제 manager 구독 여부를
+                        # 확인할 수 없다. denial 전송을 먼저 시도한 뒤 연결 자체를
+                        # 끊어 이후 memoContentUpdated 수신을 fail-closed 한다.
+                        await self._disconnect_browser_socket(sid)
+            return False
+
+        room_name = f"memo:{memo_id}"
+        await self.sio.enter_room(sid, room_name)
+        self.rooms[memo_id].add(sid)
+        self.socket_memos[sid].add(memo_id)
+
+        lock_available = True
+        try:
+            lock = await self._resolve_lock_holder(memo_id)
+        except LockDelegationError:
+            lock = None
+            lock_available = False
+        await self.sio.emit(
+            "lockStatus",
+            {
+                "memoId": memo_id,
+                "lockedBy": lock["displayName"] if lock else None,
+                "lockedByUserId": lock["userId"] if lock else None,
+                "available": lock_available,
+            },
+            to=sid,
+        )
+        return True
+
+    async def _revoke_memo_access(self, sid: str, memo_id: str) -> bool:
+        """읽기 권한이 회수된 기존 구독을 정리한다.
+
+        반환값이 참이면 Socket.IO manager에서도 퇴장을 확인하지 못했으므로 호출자가
+        denial 전송 뒤 소켓을 끊어야 한다.
+        """
+        room_eviction_failed = False
+        try:
+            await self._leave_memo(sid, memo_id)
+        except Exception:  # noqa: BLE001 - denial must still reach the client
+            logger.exception(
+                "failed to fully leave revoked memo room: sid=%s memo=%s",
+                sid,
+                memo_id,
+            )
+            try:
+                await self.sio.leave_room(sid, f"memo:{memo_id}")
+            except Exception:  # noqa: BLE001 - caller disconnects fail-closed
+                room_eviction_failed = True
+                logger.exception(
+                    "failed to leave revoked Socket.IO room: sid=%s memo=%s",
+                    sid,
+                    memo_id,
+                )
+            if memo_id in self.socket_locks.get(sid, set()):
+                try:
+                    await self._release_lock(sid, memo_id)
+                except Exception:  # noqa: BLE001 - local lease is revoked below
+                    logger.exception(
+                        "failed to release revoked memo lock: sid=%s memo=%s",
+                        sid,
+                        memo_id,
+                    )
+        finally:
+            # 위임 락 해제가 불확실해도 이 소켓이 stale lease를 계속 제시하지
+            # 못하게 한다. 원격 canonical lease는 TTL로 만료된다.
+            self.rooms[memo_id].discard(sid)
+            if not self.rooms[memo_id]:
+                self.rooms.pop(memo_id, None)
+            self.socket_memos[sid].discard(memo_id)
+            self.socket_locks[sid].discard(memo_id)
+            self._lease_tokens_for(sid).pop(memo_id, None)
+        return room_eviction_failed
 
     async def _join_project(self, sid: str, data: dict | None) -> bool:
         project_id = _get_id(data, "projectId")
