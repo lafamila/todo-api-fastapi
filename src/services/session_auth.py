@@ -450,6 +450,7 @@ class TodoSessionService:
         accounts = response.data if isinstance(response.data, list) else []
         results = []
         for account in accounts:
+            login_id = str(account.get("loginId") or "")
             permission_key = (
                 account.get("permissionKey")
                 if isinstance(account.get("permissionKey"), str)
@@ -459,9 +460,9 @@ class TodoSessionService:
             results.append(
                 {
                     "id": str(account.get("id", "")),
-                    "username": str(account.get("loginId", "")),
+                    "username": login_id,
                     "displayName": str(account.get("name", "")),
-                    "loginId": str(account.get("loginId", "")),
+                    "loginId": login_id,
                     "name": str(account.get("name", "")),
                     "email": str(account.get("email", "")),
                     "isAdmin": bool(account.get("isSuperAdmin")),

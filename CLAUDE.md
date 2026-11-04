@@ -214,6 +214,10 @@ daily_task_completions (id PK, task_type_id FK→daily_task_types, completed_dat
 
 서비스 권한(`auth-api-nest` service permission claim)과 프로젝트 역할(`project_members.role`)은 별도 축이다.
 
+멤버 초대용 `GET /api/users/search`는 auth 디렉터리의 social-only 계정에서 `loginId`가
+null/누락/빈 문자열이면 `loginId`와 `username`을 빈 문자열로 반환한다. 이름은 기존
+`name`/`displayName`에 유지하며 credential ID를 만들지 않는다. 계정 UUID와 권한 판정은 그대로다.
+
 ### Service Permission
 
 | Permission | Meaning | Main capabilities |

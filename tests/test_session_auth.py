@@ -215,6 +215,89 @@ class TodoSessionServiceOidcTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class TodoAccountSearchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_search_accounts_preserves_mixed_local_and_social_accounts(self) -> None:
+        service = session_auth.TodoSessionService()
+        service.auth_api_base_url = "http://auth.example"
+        local_id = "11111111-1111-4111-8111-111111111111"
+        social_id = "22222222-2222-4222-8222-222222222222"
+        local_account = {
+            "id": local_id,
+            "loginId": "local.user",
+            "name": "Local User",
+            "email": "local@example.test",
+            "permissionKey": "superadmin",
+            "isSuperAdmin": True,
+        }
+        for login_fields, permission, can_invite in (
+            ({"loginId": None}, "user", True),
+            ({}, "visitor", False),
+            ({"loginId": ""}, "admin", True),
+        ):
+            with self.subTest(login_fields=login_fields, permission=permission):
+                social_account = {
+                    "id": social_id,
+                    "name": "Social User",
+                    "email": "social@example.test",
+                    "permissionKey": permission,
+                    "isSuperAdmin": False,
+                    **login_fields,
+                }
+                with (
+                    patch.object(session_auth, "AUTH_SERVICE_KEY_ID", "directory-key"),
+                    patch.object(session_auth, "AUTH_SERVICE_SECRET", "directory-secret"),
+                    patch.object(
+                        service,
+                        "_request_json",
+                        return_value=session_auth._HttpResponse(
+                            status=200, headers={}, data=[local_account, social_account]
+                        ),
+                    ) as request_json,
+                ):
+                    results = await service.search_accounts("User")
+
+                request_json.assert_called_once_with(
+                    "GET",
+                    "http://auth.example/api/internal/service-accounts/search"
+                    "?serviceKey=todo&q=User",
+                    None,
+                    {
+                        "x-auth-service-key-id": "directory-key",
+                        "x-auth-service-secret": "directory-secret",
+                    },
+                    None,
+                )
+                self.assertEqual(
+                    results,
+                    [
+                        {
+                            "id": local_id,
+                            "username": "local.user",
+                            "displayName": "Local User",
+                            "loginId": "local.user",
+                            "name": "Local User",
+                            "email": "local@example.test",
+                            "isAdmin": True,
+                            "isSuperAdmin": True,
+                            "canInviteToTodo": True,
+                            "inviteDisabledReason": None,
+                        },
+                        {
+                            "id": social_id,
+                            "username": "",
+                            "displayName": "Social User",
+                            "loginId": "",
+                            "name": "Social User",
+                            "email": "social@example.test",
+                            "isAdmin": False,
+                            "isSuperAdmin": False,
+                            "canInviteToTodo": can_invite,
+                            "inviteDisabledReason": None if can_invite else "visitor",
+                        },
+                    ],
+                )
+
+
 class TodoSocketSessionValidationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.service = session_auth.TodoSessionService()
