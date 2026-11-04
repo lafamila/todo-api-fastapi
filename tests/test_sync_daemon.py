@@ -56,7 +56,7 @@ class SchemaHandshakeTests(unittest.TestCase):
         self.assertEqual(caught.exception.kind, "schema")
         self.assertIn("로컬 스키마가 앞서", caught.exception.message)
 
-    def test_local_ahead_with_drift_allowed_syncs_shared_columns_only(self) -> None:
+    def test_v2_hierarchy_drift_is_fail_closed_even_when_enabled(self) -> None:
         peer_tables = declared_tables()
         peer_tables["memos"] = [
             column for column in peer_tables["memos"] if column != "status"
@@ -64,15 +64,15 @@ class SchemaHandshakeTests(unittest.TestCase):
         original = sync_daemon_module.SYNC_ALLOW_SCHEMA_DRIFT
         sync_daemon_module.SYNC_ALLOW_SCHEMA_DRIFT = True
         try:
-            columns = self.daemon._check_schema(
-                _handshake(schemaVersion=SCHEMA_VERSION - 1, tables=peer_tables)
-            )
+            with self.assertRaises(SyncBlocked) as caught:
+                self.daemon._check_schema(
+                    _handshake(schemaVersion=2, tables=peer_tables)
+                )
         finally:
             sync_daemon_module.SYNC_ALLOW_SCHEMA_DRIFT = original
 
-        self.assertNotIn("status", columns["memos"])
-        self.assertIn("updated_at_utc", columns["memos"])
-        self.assertIn("id", columns["memos"])
+        self.assertEqual(caught.exception.kind, "schema")
+        self.assertIn("안전하게 축소할 수 없습니다", caught.exception.message)
 
     def test_peer_ahead_always_blocks(self) -> None:
         original = sync_daemon_module.SYNC_ALLOW_SCHEMA_DRIFT

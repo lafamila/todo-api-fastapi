@@ -133,6 +133,21 @@ def apply_changes(
             continue
         grouped[table].append(change)
 
+    # projects는 self-FK(parent_id)를 가진다. wire seq가 child→root 순이어도
+    # 같은 batch 안에서는 root update/insert를 먼저 적용한다.
+    def project_apply_order(change: dict) -> int:
+        row = change.get("row") or {}
+        if row.get("parent_id"):
+            return 1
+        cursor.execute("SELECT is_group FROM projects WHERE id = %s", (change.get("rowId"),))
+        existing = cursor.fetchone()
+        # Existing root→group follows child insert. A brand-new root still precedes child.
+        if existing is not None and not bool(existing.get("is_group")) and bool(row.get("is_group")):
+            return 2
+        return 0
+
+    grouped["projects"].sort(key=project_apply_order)
+
     savepoint_index = 0
     for table in SYNC_TABLE_ORDER:
         for change in grouped[table]:
@@ -322,6 +337,19 @@ def _apply_one(
 
     incoming = deserialize_row(table, change.get("row") or {}, columns)
     incoming[pk] = row_id
+    incoming, deferred_reason, rejected_reason = normalize_hierarchy_row(
+        cursor, table, row_id, incoming, existing
+    )
+    if deferred_reason:
+        outcome.deferred.append(
+            {"table": table, "rowId": row_id, "reason": deferred_reason}
+        )
+        return
+    if rejected_reason:
+        outcome.rejected.append(
+            {"table": table, "rowId": row_id, "reason": rejected_reason}
+        )
+        return
     incoming_clock = incoming.get("updated_at_utc")
     if not isinstance(incoming_clock, datetime):
         outcome.rejected.append({"table": table, "rowId": row_id, "reason": "missing_updated_at_utc"})
@@ -340,6 +368,10 @@ def _apply_one(
         outcome.applied += 1
         outcome.applied_refs.append({"table": table, "rowId": row_id})
         _detect_duplicates(cursor, table, row_id, incoming, outcome, record_issues)
+        if table == "projects" and bool(incoming.get("is_group")):
+            _migrate_group_memos(cursor, row_id)
+        if table == "memos" and incoming.get("kind") == "backlog":
+            _converge_backlogs(cursor, incoming["project_id"], outcome, record_issues)
         return
 
     existing_clock = existing.get("updated_at_utc")
@@ -394,10 +426,20 @@ def _apply_one(
         outcome.skipped += 1
         return
 
+    structural_move = bool(
+        table == "memos"
+        and existing.get("project_id") != incoming.get("project_id")
+    )
     _update_row(cursor, table, incoming, columns, pk)
     outcome.applied += 1
-    outcome.applied_refs.append({"table": table, "rowId": row_id})
+    outcome.applied_refs.append(
+        {"table": table, "rowId": row_id, "structural": structural_move}
+    )
     _detect_duplicates(cursor, table, row_id, incoming, outcome, record_issues)
+    if table == "projects" and bool(incoming.get("is_group")):
+        _migrate_group_memos(cursor, row_id)
+    if table == "memos" and incoming.get("kind") == "backlog":
+        _converge_backlogs(cursor, incoming["project_id"], outcome, record_issues)
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -471,6 +513,261 @@ def _rows_equivalent(table: str, existing: dict, incoming: dict, columns: tuple[
         if left != right:
             return False
     return True
+
+
+def _project_shape(cursor, project_id: str | None) -> dict | None:
+    if not project_id:
+        return None
+    cursor.execute(
+        """
+        SELECT p.id, p.owner_id, p.parent_id, p.is_group, p.deleted_at,
+               parent.id AS parent_exists,
+               parent.deleted_at AS parent_deleted_at
+        FROM projects p
+        LEFT JOIN projects parent ON parent.id = p.parent_id
+        WHERE p.id = %s
+        """,
+        (project_id,),
+    )
+    return cursor.fetchone()
+
+
+def _first_live_child_id(cursor, root_id: str) -> str | None:
+    cursor.execute(
+        """
+        SELECT id FROM projects
+        WHERE parent_id = %s AND deleted_at IS NULL AND is_group = 0
+        ORDER BY created_at ASC, id ASC LIMIT 1
+        """,
+        (root_id,),
+    )
+    child = cursor.fetchone()
+    return child["id"] if child else None
+
+
+def _migrate_group_memos(cursor, root_id: str) -> None:
+    """group 전환을 받은 노드에도 root memo가 남지 않게 canonical 이동한다."""
+    child_id = _first_live_child_id(cursor, root_id)
+    if child_id is None:
+        return
+    cursor.execute(
+        "UPDATE memos SET project_id = %s, updated_at = updated_at WHERE project_id = %s",
+        (child_id, root_id),
+    )
+    # articles는 sync 대상이 아니지만 로컬 snapshot 참조가 어긋나지 않게 유지한다.
+    cursor.execute(
+        "UPDATE articles SET project_id = %s WHERE project_id = %s",
+        (child_id, root_id),
+    )
+
+
+def _root_id(project: dict | None) -> str | None:
+    if not project:
+        return None
+    return project.get("parent_id") or project.get("id")
+
+
+def normalize_hierarchy_row(
+    cursor,
+    table: str,
+    row_id: str,
+    row: dict,
+    existing: dict | None = None,
+) -> tuple[dict, str | None, str | None]:
+    """계층 구조를 canonicalize하고 (row, defer, reject)를 반환한다.
+
+    오래 오프라인이던 노드가 group 전환 전 parent를 대상으로 만든 memo는 숨겨진
+    parent에 남기지 않고 결정적인 첫 live child로 이동한다. 반면 cross-root 이동이나
+    parent/kind 위조는 LWW로 받아들이지 않고 fail-closed 한다.
+    """
+    normalized = dict(row)
+
+    if table == "projects":
+        parent_id = normalized.get("parent_id")
+        if parent_id == row_id:
+            return normalized, None, "project_cannot_parent_itself"
+        if existing is not None:
+            if existing.get("deleted_at") is not None and normalized.get("deleted_at") is None:
+                return normalized, None, "project_deletion_is_irreversible"
+            if "parent_id" in normalized and normalized.get("parent_id") != existing.get("parent_id"):
+                return normalized, None, "project_parent_is_immutable"
+            if bool(existing.get("is_group")) and "is_group" in normalized and not bool(normalized.get("is_group")):
+                return normalized, None, "project_group_transition_is_irreversible"
+            if existing.get("parent_id") and bool(normalized.get("is_group")):
+                return normalized, None, "subproject_cannot_be_group"
+            if (
+                not bool(existing.get("is_group"))
+                and bool(normalized.get("is_group"))
+                and _first_live_child_id(cursor, row_id) is None
+            ):
+                return normalized, None, "group_transition_requires_child"
+            return normalized, None, None
+        if parent_id:
+            parent = _project_shape(cursor, str(parent_id))
+            if parent is None:
+                return normalized, f"missing_parent:projects:{parent_id}", None
+            if parent.get("parent_id"):
+                return normalized, None, "project_depth_exceeds_one"
+            if parent.get("deleted_at") is not None:
+                return normalized, None, "project_parent_is_deleted"
+            if normalized.get("owner_id") != parent.get("owner_id"):
+                return normalized, None, "subproject_owner_mismatch"
+            if bool(normalized.get("is_group")):
+                return normalized, None, "subproject_cannot_be_group"
+        return normalized, None, None
+
+    if table == "memos":
+        kind = normalized.get("kind", existing.get("kind") if existing else "memo")
+        if kind not in {"memo", "backlog"}:
+            return normalized, None, "invalid_memo_kind"
+        normalized["kind"] = kind
+        if existing is not None and kind != (existing.get("kind") or "memo"):
+            return normalized, None, "memo_kind_is_immutable"
+
+        target_id = normalized.get("project_id") or (existing or {}).get("project_id")
+        target = _project_shape(cursor, str(target_id) if target_id else None)
+        if target is None:
+            # normal FK deferral will keep the original reason format
+            return normalized, None, None
+        if target.get("parent_id") and target.get("parent_exists") is None:
+            return normalized, None, "memo_target_parent_missing"
+        if target.get("deleted_at") is not None or target.get("parent_deleted_at") is not None:
+            return normalized, None, "memo_target_project_is_deleted"
+        if bool(target.get("is_group")):
+            child_id = _first_live_child_id(cursor, target["id"])
+            if child_id is None:
+                return normalized, f"group_without_child:projects:{target['id']}", None
+            normalized["project_id"] = child_id
+            target = _project_shape(cursor, child_id)
+
+        if existing is not None and existing.get("project_id") != normalized.get("project_id"):
+            source = _project_shape(cursor, existing.get("project_id"))
+            if _root_id(source) != _root_id(target):
+                return normalized, None, "cross_root_memo_move_forbidden"
+        return normalized, None, None
+
+    if table == "project_members":
+        role = normalized.get("role", (existing or {}).get("role"))
+        if role not in {"owner", "editor", "viewer"}:
+            return normalized, None, "invalid_project_role"
+        project_id = normalized.get("project_id") or (existing or {}).get("project_id")
+        project = _project_shape(cursor, str(project_id) if project_id else None)
+        if project and role == "owner" and normalized.get("user_id", (existing or {}).get("user_id")) != project.get("owner_id"):
+            return normalized, None, "project_owner_membership_mismatch"
+        if existing is not None:
+            for immutable in ("project_id", "user_id"):
+                if immutable in normalized and normalized.get(immutable) != existing.get(immutable):
+                    return normalized, None, f"project_member_{immutable}_is_immutable"
+        if project and (
+            (project.get("parent_id") and project.get("parent_exists") is None)
+            or
+            project.get("deleted_at") is not None
+            or project.get("parent_deleted_at") is not None
+        ) and normalized.get("deleted_at") is None:
+            return normalized, None, "membership_target_project_is_deleted"
+    return normalized, None, None
+
+
+def _converge_backlogs(
+    cursor, project_id: str, outcome: ApplyOutcome, record_issues: bool
+) -> None:
+    """서로 다른 backlog ID를 한 identity로 수렴하고 모든 내용을 보존한다."""
+    cursor.execute(
+        """
+        SELECT * FROM memos
+        WHERE project_id = %s AND kind = 'backlog' AND deleted_at IS NULL
+        ORDER BY id ASC
+        """,
+        (project_id,),
+    )
+    rows = cursor.fetchall()
+    if len(rows) <= 1:
+        return
+
+    winner = rows[0]
+    latest = max(
+        rows,
+        key=lambda item: (item.get("updated_at_utc") or datetime.min, item["id"]),
+    )
+    now = utcnow_naive()
+    with change_log_enabled(cursor):
+        cursor.execute(
+            "SELECT COALESCE(MAX(version), 0) AS max_version FROM memo_versions WHERE memo_id = %s",
+            (winner["id"],),
+        )
+        next_version = int(cursor.fetchone()["max_version"]) + 1
+
+        for source in rows:
+            # latest body becomes current winner content, so only losing current bodies
+            # need an explicit history copy.
+            if source["id"] == latest["id"]:
+                continue
+            content = source.get("content") or ""
+            cursor.execute(
+                "SELECT id FROM memo_versions WHERE memo_id = %s AND content = %s LIMIT 1",
+                (winner["id"], content),
+            )
+            if cursor.fetchone() is None:
+                cursor.execute(
+                    """
+                    INSERT INTO memo_versions
+                        (id, memo_id, content, version, note, created_at, updated_at_utc)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        generate_id(), winner["id"], content, next_version,
+                        "백로그 중복 수렴", now, now,
+                    ),
+                )
+                next_version += 1
+
+        for loser in rows[1:]:
+            cursor.execute(
+                "SELECT id FROM memo_versions WHERE memo_id = %s ORDER BY version, created_at, id",
+                (loser["id"],),
+            )
+            for version in cursor.fetchall():
+                cursor.execute(
+                    """
+                    UPDATE memo_versions
+                    SET memo_id = %s, version = %s, updated_at_utc = %s
+                    WHERE id = %s
+                    """,
+                    (winner["id"], next_version, now, version["id"]),
+                )
+                next_version += 1
+            cursor.execute(
+                "UPDATE memos SET deleted_at = %s, updated_at_utc = %s WHERE id = %s",
+                (now, now, loser["id"]),
+            )
+            outcome.applied_refs.append({"table": "memos", "rowId": loser["id"]})
+
+        if winner.get("content") != latest.get("content"):
+            cursor.execute(
+                """
+                UPDATE memos
+                SET content = %s, updated_at = %s, updated_at_utc = %s
+                WHERE id = %s
+                """,
+                (
+                    latest.get("content") or "",
+                    latest.get("updated_at") or now,
+                    latest.get("updated_at_utc") or now,
+                    winner["id"],
+                ),
+            )
+            outcome.applied_refs.append({"table": "memos", "rowId": winner["id"]})
+
+    duplicate = {
+        "kind": "duplicate_memo",
+        "table": "memos",
+        "refId": winner["id"],
+        "peerRefIds": [row["id"] for row in rows[1:]],
+        "resolution": "backlog_converged",
+    }
+    outcome.duplicates.append(duplicate)
+    if record_issues:
+        logger.info("backlog duplicates converged: %s", duplicate)
 
 
 def _missing_parent(cursor, table: str, row: dict) -> str | None:
@@ -592,6 +889,9 @@ def _detect_duplicates(
         return
     if row.get("deleted_at") is not None:
         return
+    if table == "memos" and row.get("kind") == "backlog":
+        # backlog singleton은 _converge_backlogs가 자동·무손실로 해소한다.
+        return
 
     name = normalize_name(row.get(column))
     if not name:
@@ -601,7 +901,7 @@ def _detect_duplicates(
     if scope_column:
         cursor.execute(
             f"SELECT id, {column} AS label FROM `{table}` "
-            f"WHERE {scope_column} = %s AND id <> %s AND deleted_at IS NULL",
+            f"WHERE {scope_column} <=> %s AND id <> %s AND deleted_at IS NULL",
             (row.get(scope_column), row_id),
         )
     else:

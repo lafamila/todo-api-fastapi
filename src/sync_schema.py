@@ -16,7 +16,8 @@ import unicodedata
 # 동기화 대상 컬럼/테이블을 바꿀 때마다 올린다.
 #   1 — (가상) 동기화 도입 이전 스키마
 #   2 — updated_at_utc / tombstone / memo_versions.note / change_log 도입
-SCHEMA_VERSION = 2
+#   3 — project hierarchy/group + memo kind(backlog) 도입
+SCHEMA_VERSION = 3
 
 # FK 의존성 순서 — push 적용은 반드시 이 순서를 따른다.
 # (오프라인에서 "프로젝트 생성 → 그 안에 메모 생성" 이 흔하다.)
@@ -33,6 +34,8 @@ SYNC_TABLES: dict[str, dict] = {
         "columns": (
             "id",
             "owner_id",
+            "parent_id",
+            "is_group",
             "name",
             "icon",
             "status",
@@ -43,9 +46,10 @@ SYNC_TABLES: dict[str, dict] = {
             "deleted_at",
         ),
         # (컬럼, 부모 테이블) — 값이 있으면 부모 행이 먼저 존재해야 한다
-        "parents": (),
+        # self-FK. apply_changes 는 같은 batch의 root를 child보다 먼저 적용한다.
+        "parents": (("parent_id", "projects"),),
         # 이름 중복 감지 축
-        "duplicate_scope": None,
+        "duplicate_scope": "parent_id",
         "duplicate_column": "name",
         "duplicate_kind": "duplicate_project",
     },
@@ -55,6 +59,7 @@ SYNC_TABLES: dict[str, dict] = {
             "id",
             "project_id",
             "created_by",
+            "kind",
             "title",
             "content",
             "status",

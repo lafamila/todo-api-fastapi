@@ -683,6 +683,76 @@ class MemoRealtimeServer:
             self._lease_tokens_for(sid).pop(memo_id, None)
         return room_eviction_failed
 
+    async def revoke_project_access(self, project_ids: list[str]) -> None:
+        """프로젝트 tombstone 직후 stale project/memo room과 lease를 즉시 제거한다."""
+        targets = set(project_ids)
+        for sid, user_info in list(self.users.items()):
+            for project_id in targets & set(self.socket_projects.get(sid, set())):
+                if await asyncio.to_thread(
+                    self._can_access_project, project_id, user_info, False
+                ):
+                    continue
+                try:
+                    await self.sio.leave_room(sid, f"project:{project_id}")
+                finally:
+                    self.socket_projects[sid].discard(project_id)
+                await self.sio.emit(
+                    "projectAccessDenied", {"projectId": project_id}, to=sid
+                )
+
+            for memo_id in list(self.socket_memos.get(sid, set())):
+                can_read = await asyncio.to_thread(
+                    self._can_access_memo, memo_id, user_info, False
+                )
+                if can_read:
+                    can_write = await asyncio.to_thread(
+                        self._can_access_memo, memo_id, user_info, True
+                    )
+                    if not can_write and memo_id in self.socket_locks.get(sid, set()):
+                        await self._release_lock(sid, memo_id)
+                    continue
+                disconnect = await self._revoke_memo_access(sid, memo_id)
+                try:
+                    await self.sio.emit(
+                        "memoAccessDenied", {"memoId": memo_id}, to=sid
+                    )
+                finally:
+                    if disconnect:
+                        await self._disconnect_browser_socket(sid)
+                        break
+
+    async def revalidate_memo_access(self, memo_id: str) -> None:
+        """메모 이동 직후 대상 프로젝트 권한이 없는 구독/lease를 즉시 제거한다."""
+        for sid in list(self.rooms.get(memo_id, set())):
+            user_info = self.users.get(sid)
+            can_read = bool(
+                user_info
+                and await asyncio.to_thread(
+                    self._can_access_memo, memo_id, user_info, False
+                )
+            )
+            if can_read:
+                can_write = await asyncio.to_thread(
+                    self._can_access_memo, memo_id, user_info, True
+                )
+                if not can_write and memo_id in self.socket_locks.get(sid, set()):
+                    await self._release_lock(sid, memo_id)
+                continue
+            disconnect = await self._revoke_memo_access(sid, memo_id)
+            try:
+                await self.sio.emit("memoAccessDenied", {"memoId": memo_id}, to=sid)
+            finally:
+                if disconnect:
+                    await self._disconnect_browser_socket(sid)
+
+    async def emit_projects_changed(self) -> None:
+        """프로젝트/멤버/메모 배치 변경을 인증된 브라우저에 내용 없이 알린다."""
+        for sid in list(self.users):
+            try:
+                await self.sio.emit("projectsChanged", {}, to=sid)
+            except Exception:  # noqa: BLE001 - 한 stale socket이 다른 탭 알림을 막지 않는다
+                logger.debug("projectsChanged emit raced with socket close: %s", sid)
+
     async def _join_project(self, sid: str, data: dict | None) -> bool:
         project_id = _get_id(data, "projectId")
         user_info = self.users.get(sid)
@@ -884,8 +954,16 @@ class MemoRealtimeServer:
             with get_db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
-                        "SELECT project_id FROM memos "
-                        "WHERE id = %s AND deleted_at IS NULL",
+                        """
+                        SELECT m.project_id
+                        FROM memos m
+                        JOIN projects p ON p.id = m.project_id
+                        LEFT JOIN projects parent ON parent.id = p.parent_id
+                        WHERE m.id = %s AND m.deleted_at IS NULL
+                          AND p.deleted_at IS NULL AND p.is_group = 0
+                          AND (p.parent_id IS NULL OR
+                               (parent.id IS NOT NULL AND parent.deleted_at IS NULL))
+                        """,
                         (memo_id,),
                     )
                     memo = cursor.fetchone()

@@ -124,6 +124,9 @@ def init_db():
                 """
                 CREATE TABLE IF NOT EXISTS projects (
                     id VARCHAR(50) PRIMARY KEY,
+                    owner_id VARCHAR(50) NULL,
+                    parent_id VARCHAR(50) NULL,
+                    is_group BOOLEAN NOT NULL DEFAULT FALSE,
                     name VARCHAR(255) NOT NULL,
                     icon VARCHAR(10) NOT NULL,
                     status INT NOT NULL DEFAULT 0,
@@ -143,6 +146,8 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS memos (
                     id VARCHAR(50) PRIMARY KEY,
                     project_id VARCHAR(50) NOT NULL,
+                    created_by VARCHAR(50) NULL,
+                    kind VARCHAR(20) NOT NULL DEFAULT 'memo',
                     title VARCHAR(255) NOT NULL,
                     content LONGTEXT,
                     status INT NOT NULL DEFAULT 0,
@@ -361,6 +366,12 @@ _UTC_BACKFILL_SOURCE = {
 }
 
 _SYNC_ADDITIVE_DDL = (
+    # project hierarchy / shared backlog (schema v3)
+    "ALTER TABLE projects ADD COLUMN parent_id VARCHAR(50) NULL AFTER owner_id",
+    "ALTER TABLE projects ADD COLUMN is_group BOOLEAN NOT NULL DEFAULT FALSE AFTER parent_id",
+    "ALTER TABLE projects ADD INDEX idx_projects_parent_id (parent_id)",
+    "ALTER TABLE memos ADD COLUMN kind VARCHAR(20) NOT NULL DEFAULT 'memo' AFTER created_by",
+    "ALTER TABLE memos ADD INDEX idx_memos_project_kind (project_id, kind)",
     # updated_at_utc — 기존 DB 에는 NULL 허용으로 추가한 뒤 백필하고 NOT NULL 로 조인다
     "ALTER TABLE projects ADD COLUMN updated_at_utc DATETIME(3) NULL AFTER updated_at",
     "ALTER TABLE memos ADD COLUMN updated_at_utc DATETIME(3) NULL AFTER updated_at",

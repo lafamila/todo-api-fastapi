@@ -200,7 +200,72 @@ class RealtimeDelegationTests(unittest.IsolatedAsyncioTestCase):
         server.socket_allows_offline = {}
         server.session_revalidation_tasks = {}
         server._can_access_memo = lambda *_args: True
+        server._can_access_project = lambda *_args: True
         return server
+
+    async def test_memo_move_revalidation_evicts_stale_reader_and_lease(self) -> None:
+        server = self._server()
+        server.rooms["memo-1"].add("sid-1")
+        server.sio.room_members["memo:memo-1"].add("sid-1")
+        server.socket_locks["sid-1"].add("memo-1")
+        server.socket_lease_tokens["sid-1"]["memo-1"] = (
+            "stale-token", realtime.monotonic() + 60,
+        )
+        server._can_access_memo = lambda *_args: False
+
+        await server.revalidate_memo_access("memo-1")
+
+        self.assertNotIn("memo-1", server.socket_memos["sid-1"])
+        self.assertNotIn("memo-1", server.socket_locks["sid-1"])
+        self.assertNotIn("sid-1", server.sio.room_members["memo:memo-1"])
+        self.assertEqual(server.sio.emits[-1][0], "memoAccessDenied")
+
+    async def test_role_downgrade_keeps_read_room_but_releases_write_lease(self) -> None:
+        server = self._server()
+        server.rooms["memo-1"].add("sid-1")
+        server.sio.room_members["memo:memo-1"].add("sid-1")
+        with patch.object(realtime, "runs_sync_daemon", return_value=False):
+            await server._acquire_lock("sid-1", "memo-1", renewal=False)
+            server._can_access_memo = lambda _memo, _user, write: not write
+            await server.revalidate_memo_access("memo-1")
+
+        self.assertIn("memo-1", server.socket_memos["sid-1"])
+        self.assertIn("sid-1", server.sio.room_members["memo:memo-1"])
+        self.assertNotIn("memo-1", server.socket_locks["sid-1"])
+        self.assertNotIn("memo-1", server.socket_lease_tokens["sid-1"])
+        self.assertIsNone(server.lock_registry.holder("memo-1"))
+
+    async def test_recursive_delete_revalidates_project_and_every_memo_room(self) -> None:
+        server = self._server()
+        server.socket_projects["sid-1"].update({"root", "child"})
+        server.sio.room_members["project:root"].add("sid-1")
+        server.sio.room_members["project:child"].add("sid-1")
+        server.socket_memos["sid-1"].add("memo-2")
+        for memo_id in ("memo-1", "memo-2"):
+            server.rooms[memo_id].add("sid-1")
+            server.sio.room_members[f"memo:{memo_id}"].add("sid-1")
+        server._can_access_project = lambda *_args: False
+        server._can_access_memo = lambda *_args: False
+
+        await server.revoke_project_access(["root", "child"])
+
+        self.assertFalse(server.socket_projects["sid-1"])
+        self.assertFalse(server.socket_memos["sid-1"])
+        denied = [event for event, _payload, _kwargs in server.sio.emits]
+        self.assertEqual(denied.count("projectAccessDenied"), 2)
+        self.assertEqual(denied.count("memoAccessDenied"), 2)
+
+    async def test_projects_changed_payload_is_empty_and_browser_only(self) -> None:
+        server = self._server()
+        server.users["sid-2"] = {"user_id": "user-2", "display_name": "Other"}
+        server.peer_sockets = {"peer-sid": "account-1"}
+
+        await server.emit_projects_changed()
+
+        events = [item for item in server.sio.emits if item[0] == "projectsChanged"]
+        self.assertEqual(len(events), 2)
+        self.assertTrue(all(payload == {} for _event, payload, _kwargs in events))
+        self.assertEqual({kwargs["to"] for _event, _payload, kwargs in events}, {"sid-1", "sid-2"})
 
     async def test_revoked_reader_rejoin_removes_room_and_owned_lock(self) -> None:
         server = self._server()

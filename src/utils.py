@@ -12,37 +12,54 @@ def generate_id():
     return str(uuid.uuid4())
 
 
+def backlog_id(project_id: str) -> str:
+    """모든 노드가 같은 프로젝트 백로그에 같은 UUID를 사용한다."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"todo-backlog:{project_id}"))
+
+
 def is_service_owner(user: dict) -> bool:
     return user.get("permission") == "owner"
 
 
 def check_project_membership(cursor, project_id: str, user: dict):
+    cursor.execute(
+        """
+        SELECT p.id, pm.id AS member_id
+        FROM projects p
+        LEFT JOIN projects parent ON parent.id = p.parent_id
+        LEFT JOIN project_members pm
+          ON pm.project_id = p.id AND pm.user_id = %s AND pm.deleted_at IS NULL
+        WHERE p.id = %s AND p.deleted_at IS NULL
+          AND (p.parent_id IS NULL OR (parent.id IS NOT NULL AND parent.deleted_at IS NULL))
+        """,
+        (user["id"], project_id),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return False
     if is_service_owner(user):
         return True
-
-    cursor.execute(
-        "SELECT id FROM project_members "
-        "WHERE project_id = %s AND user_id = %s AND deleted_at IS NULL",
-        (project_id, user["id"]),
-    )
-    if cursor.fetchone():
-        return True
-
-    return False
+    return bool(row["member_id"])
 
 
 def get_project_role(cursor, project_id: str, user: dict) -> str | None:
-    if is_service_owner(user):
-        return PROJECT_OWNER_ROLE
-
     cursor.execute(
-        "SELECT role FROM project_members "
-        "WHERE project_id = %s AND user_id = %s AND deleted_at IS NULL",
-        (project_id, user["id"]),
+        """
+        SELECT p.id, pm.role
+        FROM projects p
+        LEFT JOIN projects parent ON parent.id = p.parent_id
+        LEFT JOIN project_members pm
+          ON pm.project_id = p.id AND pm.user_id = %s AND pm.deleted_at IS NULL
+        WHERE p.id = %s AND p.deleted_at IS NULL
+          AND (p.parent_id IS NULL OR (parent.id IS NOT NULL AND parent.deleted_at IS NULL))
+        """,
+        (user["id"], project_id),
     )
     member = cursor.fetchone()
     if not member:
         return None
+    if is_service_owner(user):
+        return PROJECT_OWNER_ROLE
     return member["role"]
 
 

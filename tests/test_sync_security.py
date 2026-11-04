@@ -88,25 +88,31 @@ class PushSchemaGuardTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as caught:
             await sync_push(body, _principal())
         self.assertEqual(caught.exception.status_code, 409)
-        self.assertEqual(caught.exception.detail["code"], "sync_schema_mismatch")
+        self.assertEqual(
+            caught.exception.detail["code"],
+            "sync_hierarchy_schema_upgrade_required",
+        )
 
-    def test_explicit_older_schema_negotiates_declared_columns(self) -> None:
+    def test_explicit_v2_drift_is_rejected_because_structural_fields_are_security_critical(self) -> None:
         tables = declared_tables()
         tables["memos"] = [
             column for column in tables["memos"] if column != "status"
         ]
-        columns = _resolve_push_columns(
-            SyncPushRequest(
-                clientId=CLIENT_ID,
-                schemaVersion=SCHEMA_VERSION - 1,
-                allowSchemaDrift=True,
-                tables=tables,
-                changes=[SyncChangeInput(table="memos", rowId="m1")],
+        with self.assertRaises(HTTPException) as caught:
+            _resolve_push_columns(
+                SyncPushRequest(
+                    clientId=CLIENT_ID,
+                    schemaVersion=2,
+                    allowSchemaDrift=True,
+                    tables=tables,
+                    changes=[SyncChangeInput(table="memos", rowId="m1")],
+                )
             )
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(
+            caught.exception.detail["code"],
+            "sync_hierarchy_schema_upgrade_required",
         )
-        self.assertNotIn("status", columns["memos"])
-        self.assertIn("id", columns["memos"])
-        self.assertIn("updated_at_utc", columns["memos"])
 
     def test_change_model_preserves_base_clock_metadata(self) -> None:
         change = SyncChangeInput(

@@ -52,7 +52,13 @@ try:
     from ..timeutil import iso_utc, utcnow_naive
     from ..services.lock_registry import get_lock_registry
     from ..services.merge import MergeError, merge_memos, merge_projects
-    from ..services.sync_apply import ReceiptPayloadMismatch, SIDE_CLIENT, apply_changes
+    from ..services.realtime import get_realtime_server
+    from ..services.sync_apply import (
+        ReceiptPayloadMismatch,
+        SIDE_CLIENT,
+        apply_changes,
+        normalize_hierarchy_row,
+    )
     from ..services.sync_auth import (
         AccountResolutionError,
         SyncAuthError,
@@ -97,7 +103,13 @@ except ImportError:  # pragma: no cover
     from timeutil import iso_utc, utcnow_naive
     from services.lock_registry import get_lock_registry
     from services.merge import MergeError, merge_memos, merge_projects
-    from services.sync_apply import ReceiptPayloadMismatch, SIDE_CLIENT, apply_changes
+    from services.realtime import get_realtime_server
+    from services.sync_apply import (
+        ReceiptPayloadMismatch,
+        SIDE_CLIENT,
+        apply_changes,
+        normalize_hierarchy_row,
+    )
     from services.sync_auth import (
         AccountResolutionError,
         SyncAuthError,
@@ -241,6 +253,17 @@ def _resolve_push_columns(body: SyncPushRequest) -> dict[str, tuple[str, ...]]:
     """push 스키마를 적용 **전에** 검증하고 명시적 drift 협상만 허용한다."""
     if body.schemaVersion == SCHEMA_VERSION:
         return {}
+    # v3의 parent_id/is_group/kind는 권한 경계다. v2 교집합 적용은 child를 root로,
+    # backlog를 일반 memo로 바꾸므로 allowSchemaDrift로도 허용하지 않는다.
+    if body.schemaVersion < 3:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "sync_hierarchy_schema_upgrade_required",
+                "serverSchemaVersion": SCHEMA_VERSION,
+                "clientSchemaVersion": body.schemaVersion,
+            },
+        )
     if not body.allowSchemaDrift:
         raise HTTPException(
             status_code=409,
@@ -337,15 +360,31 @@ def _memo_project_id(
     return memo.get("project_id") if memo else None
 
 
-def _forbidden_change(table: str, row_id: str) -> HTTPException:
+def _forbidden_change(
+    table: str, row_id: str, reason: str | None = None
+) -> HTTPException:
     return HTTPException(
         status_code=403,
         detail={
             "code": "sync_change_forbidden",
             "table": table,
             "rowId": row_id,
+            "reason": reason,
         },
     )
+
+
+def _root_project_id(
+    cursor, project_id: str, incoming_projects: dict[str, dict]
+) -> str | None:
+    incoming = incoming_projects.get(project_id)
+    if incoming is not None:
+        return str(incoming.get("parent_id") or project_id)
+    cursor.execute("SELECT id, parent_id FROM projects WHERE id = %s", (project_id,))
+    project = cursor.fetchone()
+    if project is None:
+        return None
+    return str(project.get("parent_id") or project["id"])
 
 
 def _authorize_sync_changes(
@@ -360,6 +399,15 @@ def _authorize_sync_changes(
     `baseUpdatedAtUtc` 같은 프로토콜 메타데이터는 payload 에 보존하고, 권한 판정에 쓰는
     row 필드만 협상된 화이트리스트로 정규화한다.
     """
+    raw_incoming_projects = {
+        str(change.get("rowId") or ""): filter_row(
+            "projects",
+            change.get("row") or {},
+            (columns_by_table or {}).get("projects"),
+        )
+        for change in payload
+        if change.get("table") == "projects" and change.get("row")
+    }
     normalized: list[tuple[dict, dict]] = []
     for change in payload:
         table = change.get("table")
@@ -367,6 +415,27 @@ def _authorize_sync_changes(
             continue
         allowed = (columns_by_table or {}).get(table)
         row = filter_row(table, change.get("row") or {}, allowed)
+        row_id = str(change.get("rowId") or "")
+        cursor.execute(
+            f"SELECT * FROM `{table}` WHERE {SYNC_TABLES[table]['pk']} = %s",
+            (row_id,),
+        )
+        row, deferred_reason, rejected_reason = normalize_hierarchy_row(
+            cursor, table, row_id, row, cursor.fetchone()
+        )
+        paired_group_transition = rejected_reason == "group_transition_requires_child" and any(
+            candidate.get("parent_id") == row_id
+            and candidate.get("owner_id") == row.get("owner_id")
+            and not bool(candidate.get("is_group"))
+            and candidate.get("deleted_at") is None
+            for candidate in raw_incoming_projects.values()
+        )
+        if rejected_reason and not paired_group_transition:
+            raise _forbidden_change(table, row_id, rejected_reason)
+        if deferred_reason and not deferred_reason.startswith(
+            ("missing_parent:", "parent_not_group:")
+        ):
+            raise _forbidden_change(table, row_id, deferred_reason)
         normalized.append((change, row))
 
     incoming_projects = {
@@ -379,6 +448,25 @@ def _authorize_sync_changes(
         for change, row in normalized
         if change.get("table") == "memos" and row
     }
+    # 새 group+child+memo가 한 batch에 들어온 경우 DB에는 아직 group이 없다.
+    # apply와 같은 canonical first child를 골라 그 child 권한으로 검사한다.
+    for change, row in normalized:
+        if change.get("table") != "memos" or not row:
+            continue
+        target = incoming_projects.get(str(row.get("project_id") or ""))
+        if not target or not bool(target.get("is_group")):
+            continue
+        children = [
+            (project_id, candidate)
+            for project_id, candidate in incoming_projects.items()
+            if candidate.get("parent_id") == row.get("project_id")
+            and not bool(candidate.get("is_group"))
+            and candidate.get("deleted_at") is None
+        ]
+        if not children:
+            raise _forbidden_change("memos", str(change.get("rowId") or ""), "group_has_no_child")
+        children.sort(key=lambda item: (str(item[1].get("created_at") or ""), item[0]))
+        row["project_id"] = children[0][0]
     role_cache: dict[str, str | None] = {}
 
     def role_for(project_id: str | None) -> str | None:
@@ -404,22 +492,84 @@ def _authorize_sync_changes(
         existing_project = _existing_project_id(cursor, table, row_id)
 
         if table == "projects":
-            cursor.execute("SELECT owner_id FROM projects WHERE id = %s", (row_id,))
+            cursor.execute("SELECT * FROM projects WHERE id = %s", (row_id,))
             existing = cursor.fetchone()
             incoming_owner = row.get("owner_id")
             if existing is None:
                 if not row or incoming_owner != account_id:
                     raise _forbidden_change(table, row_id)
+                parent_id = row.get("parent_id")
+                if not parent_id and bool(row.get("is_group")):
+                    has_child = any(
+                        candidate.get("parent_id") == row_id
+                        and candidate.get("owner_id") == incoming_owner
+                        and not bool(candidate.get("is_group"))
+                        and candidate.get("deleted_at") is None
+                        for candidate in incoming_projects.values()
+                    )
+                    if not has_child:
+                        raise _forbidden_change(
+                            table, row_id, "new_group_requires_child"
+                        )
+                if parent_id:
+                    parent = incoming_projects.get(str(parent_id))
+                    if parent is None:
+                        cursor.execute("SELECT * FROM projects WHERE id = %s", (parent_id,))
+                        parent = cursor.fetchone()
+                    if (
+                        parent is None
+                        or parent.get("parent_id")
+                        or parent.get("owner_id") != account_id
+                        or parent.get("deleted_at") is not None
+                        or not bool(parent.get("is_group"))
+                    ):
+                        raise _forbidden_change(table, row_id, "invalid_subproject_parent")
                 role_cache[row_id] = "owner"
                 continue
             if _project_role(cursor, row_id, account_id) != "owner":
                 raise _forbidden_change(table, row_id)
             if incoming_owner is not None and incoming_owner != existing.get("owner_id"):
                 raise _forbidden_change(table, row_id)
+            if not bool(existing.get("is_group")) and bool(row.get("is_group")):
+                cursor.execute(
+                    "SELECT 1 AS ok FROM projects WHERE parent_id = %s AND deleted_at IS NULL LIMIT 1",
+                    (row_id,),
+                )
+                has_child = cursor.fetchone() is not None or any(
+                    candidate.get("parent_id") == row_id
+                    and candidate.get("owner_id") == existing.get("owner_id")
+                    and not bool(candidate.get("is_group"))
+                    and candidate.get("deleted_at") is None
+                    for candidate in incoming_projects.values()
+                )
+                if not has_child:
+                    raise _forbidden_change(
+                        table, row_id, "group_transition_requires_child"
+                    )
             continue
 
         if table == "memos":
             incoming_project = row.get("project_id") or existing_project
+            if existing_project and incoming_project and existing_project != incoming_project:
+                source_root = _root_project_id(
+                    cursor, str(existing_project), incoming_projects
+                )
+                target_root = _root_project_id(
+                    cursor, str(incoming_project), incoming_projects
+                )
+                if source_root != target_root or role_for(source_root) != "owner":
+                    raise _forbidden_change(
+                        table, row_id, "memo_move_requires_root_owner"
+                    )
+            if (
+                existing_project
+                and (
+                    row.get("deleted_at") is not None
+                    or (change.get("op") == "delete" and change.get("row") is None)
+                )
+                and role_for(str(existing_project)) != "owner"
+            ):
+                raise _forbidden_change(table, row_id, "memo_delete_requires_owner")
             for project_id in {existing_project, incoming_project} - {None}:
                 if role_for(str(project_id)) not in {"owner", "editor"}:
                     raise _forbidden_change(table, row_id)
@@ -448,7 +598,18 @@ def _authorize_sync_changes(
 
 
 def _require_memo_write_access(cursor, memo_id: str, account_id: str) -> None:
-    cursor.execute("SELECT project_id FROM memos WHERE id = %s", (memo_id,))
+    cursor.execute(
+        """
+        SELECT m.project_id
+        FROM memos m
+        JOIN projects p ON p.id = m.project_id
+        LEFT JOIN projects parent ON parent.id = p.parent_id
+        WHERE m.id = %s AND m.deleted_at IS NULL
+          AND p.deleted_at IS NULL AND p.is_group = 0
+          AND (p.parent_id IS NULL OR (parent.id IS NOT NULL AND parent.deleted_at IS NULL))
+        """,
+        (memo_id,),
+    )
     memo = cursor.fetchone()
     if memo is None:
         raise HTTPException(status_code=404, detail="Memo not found")
@@ -597,6 +758,7 @@ async def sync_push(
         with conn.cursor() as cursor:
             max_seq = max_change_seq(cursor)
 
+    await _revalidate_after_sync_push(outcome.applied_refs, payload)
     await _notify_sync_changed(principal.account_id, max_seq)
 
     response = outcome.as_dict()
@@ -612,6 +774,43 @@ async def sync_push(
         }
     )
     return response
+
+
+async def _revalidate_after_sync_push(
+    applied_refs: list[dict], payload: list[dict]
+) -> None:
+    """push 권한 변경을 다음 browser broadcast 전에 room/lease에 반영한다."""
+    server = get_realtime_server()
+    if server is None or not server.available:
+        return
+    applied = {(ref.get("table"), ref.get("rowId")) for ref in applied_refs}
+    rows = {
+        (change.get("table"), change.get("rowId")): change.get("row") or {}
+        for change in payload
+    }
+    project_ids = {
+        str(row_id)
+        for table, row_id in applied
+        if table == "projects" and row_id
+    }
+    project_ids.update(
+        str(rows[(table, row_id)]["project_id"])
+        for table, row_id in applied
+        if table == "project_members"
+        and rows.get((table, row_id), {}).get("project_id")
+    )
+    if project_ids:
+        await server.revoke_project_access(sorted(project_ids))
+    for table, row_id in applied:
+        if table == "memos" and row_id:
+            await server.revalidate_memo_access(str(row_id))
+    if any(
+        table in {"projects", "project_members"}
+        or bool(ref.get("structural"))
+        for ref in applied_refs
+        for table in [ref.get("table")]
+    ):
+        await server.emit_projects_changed()
 
 
 @router.post("/locks/{memo_id}/acquire")
@@ -705,12 +904,28 @@ def _execute_peer_merge(kind: str, loser_id: str, winner_id: str, account_id: st
 def _owning_project_id(cursor, kind: str, row_id: str) -> str | None:
     if kind == "project":
         cursor.execute(
-            "SELECT id FROM projects WHERE id = %s AND deleted_at IS NULL", (row_id,)
+            """
+            SELECT p.id
+            FROM projects p
+            LEFT JOIN projects parent ON parent.id = p.parent_id
+            WHERE p.id = %s AND p.deleted_at IS NULL
+              AND (p.parent_id IS NULL OR (parent.id IS NOT NULL AND parent.deleted_at IS NULL))
+            """,
+            (row_id,),
         )
         row = cursor.fetchone()
         return row["id"] if row else None
     cursor.execute(
-        "SELECT project_id FROM memos WHERE id = %s AND deleted_at IS NULL", (row_id,)
+        """
+        SELECT m.project_id
+        FROM memos m
+        JOIN projects p ON p.id = m.project_id
+        LEFT JOIN projects parent ON parent.id = p.parent_id
+        WHERE m.id = %s AND m.deleted_at IS NULL AND p.deleted_at IS NULL
+          AND p.is_group = 0
+          AND (p.parent_id IS NULL OR (parent.id IS NOT NULL AND parent.deleted_at IS NULL))
+        """,
+        (row_id,),
     )
     row = cursor.fetchone()
     return row["project_id"] if row else None

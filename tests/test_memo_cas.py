@@ -60,6 +60,10 @@ class _Cursor:
         self.statements.append((normalized, params))
         if normalized.startswith("SELECT * FROM memos"):
             self._result = self.memo.copy()
+        elif normalized.startswith("SELECT p.id, p.owner_id, p.parent_id, p.is_group"):
+            self._result = {
+                "id": params[0], "owner_id": "user-1", "parent_id": None, "is_group": 0,
+            }
         elif normalized.startswith("SELECT COALESCE(MAX(version)"):
             self._result = {"max_version": 2}
         elif normalized.startswith("UPDATE memos"):

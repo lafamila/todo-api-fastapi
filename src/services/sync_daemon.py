@@ -286,6 +286,13 @@ class SyncDaemon:
                 f"로컬 스키마가 앞서 있습니다 (로컬 {SCHEMA_VERSION} > 원격 {peer_version}). "
                 "원격 배포 후 재개하세요."
             )
+            if peer_version < 3 <= SCHEMA_VERSION:
+                raise SyncBlocked(
+                    "schema",
+                    message
+                    + " hierarchy/backlog 스키마는 공통 필드 모드로 안전하게 축소할 수 없습니다.",
+                    {"local": SCHEMA_VERSION, "peer": peer_version},
+                )
             if not SYNC_ALLOW_SCHEMA_DRIFT:
                 raise SyncBlocked(
                     "schema", message, {"local": SCHEMA_VERSION, "peer": peer_version}
@@ -823,10 +830,39 @@ class SyncDaemon:
         if not applied_rows:
             return
 
-        for entry in applied_rows:
-            if entry.get("table") != "memos":
-                continue
+        # 권한/구조 변경을 content emit보다 먼저 반영한다. stale room을 먼저
+        # 퇴장시키지 않으면 pull 직후 새 본문이 한 번 누출될 수 있다.
+        affected_projects = {
+            entry["rowId"]
+            for entry in applied_rows
+            if entry.get("table") == "projects"
+        }
+        affected_projects.update(
+            (entry.get("row") or {}).get("project_id")
+            for entry in applied_rows
+            if entry.get("table") == "project_members"
+            and (entry.get("row") or {}).get("project_id")
+        )
+        if affected_projects:
+            await server.revoke_project_access(sorted(affected_projects))
+
+        memo_entries = [
+            entry for entry in applied_rows if entry.get("table") == "memos"
+        ]
+        for entry in memo_entries:
+            await server.revalidate_memo_access(entry["rowId"])
+
+        if any(
+            entry.get("table") in {"projects", "project_members"}
+            or bool(entry.get("structural"))
+            for entry in applied_rows
+        ):
+            await server.emit_projects_changed()
+
+        for entry in memo_entries:
             row = entry.get("row") or {}
+            if row.get("deleted_at") is not None:
+                continue
             await server.emit_memo_pulled(
                 entry["rowId"],
                 row.get("content"),

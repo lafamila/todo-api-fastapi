@@ -42,22 +42,74 @@ def pending_change_count(cursor, since_seq: int) -> int:
     return int(cursor.fetchone()["pending"])
 
 
-def visible_project_ids(cursor, account_id: str) -> set[str]:
-    """그 계정이 볼 수 있는 프로젝트 id (소유 또는 살아있는 멤버십 경유).
+def project_scope_ids(cursor, account_id: str) -> tuple[set[str], set[str], set[str]]:
+    """계정의 (살아있는 본문 scope, 탐색 전용 parent, 과거 직접 scope).
 
-    단일 사용자에서는 전체와 같지만, 다중 사용자에서는 변경 피드가 남의 데이터를
-    흘리지 않게 하는 유일한 방어선이다.
+    child 멤버에게 parent row는 accordion 탐색용으로만 보인다. parent의 memo/member를
+    보내면 독립 child membership 경계가 무너지므로 세 집합을 반드시 분리한다.
+    과거 직접 scope는 membership/project tombstone을 기존 사용자에게 전달하는 데만 쓴다.
     """
     cursor.execute(
         """
-        SELECT DISTINCT p.id
+        SELECT DISTINCT p.id, p.parent_id, p.deleted_at, parent.id AS parent_exists,
+               parent.deleted_at AS parent_deleted_at,
+               pm.id AS member_id, pm.deleted_at AS member_deleted_at
         FROM projects p
         LEFT JOIN project_members pm
-               ON pm.project_id = p.id AND pm.user_id = %s AND pm.deleted_at IS NULL
+               ON pm.project_id = p.id AND pm.user_id = %s
+        LEFT JOIN projects parent ON parent.id = p.parent_id
         WHERE p.owner_id = %s OR pm.id IS NOT NULL
         """,
         (account_id, account_id),
     )
+    rows = cursor.fetchall()
+    historical = {row["id"] for row in rows}
+    live = {
+        row["id"]
+        for row in rows
+        if row.get("deleted_at") is None
+        and (
+            row.get("parent_id") is None
+            or (
+                row.get("parent_exists") is not None
+                and row.get("parent_deleted_at") is None
+            )
+        )
+        and (
+            # owner_id match is encoded by a row without requiring membership.
+            row.get("member_id") is None
+            or row.get("member_deleted_at") is None
+        )
+    }
+    # The query does not expose owner_id in its result. A deleted membership on an owned
+    # project would otherwise hide it; resolve owner projects explicitly and union them.
+    cursor.execute(
+        """
+        SELECT p.id
+        FROM projects p
+        LEFT JOIN projects parent ON parent.id = p.parent_id
+        WHERE p.owner_id = %s AND p.deleted_at IS NULL
+          AND (p.parent_id IS NULL OR (parent.id IS NOT NULL AND parent.deleted_at IS NULL))
+        """,
+        (account_id,),
+    )
+    live.update(row["id"] for row in cursor.fetchall())
+    navigation = {
+        row["parent_id"]
+        for row in rows
+        if row["id"] in live and row.get("parent_id")
+    }
+    return live, navigation, historical
+
+
+def visible_project_ids(cursor, account_id: str) -> set[str]:
+    """그 계정이 실제 본문을 볼 수 있는 살아있는 프로젝트 id."""
+    live, _navigation, _historical = project_scope_ids(cursor, account_id)
+    return live
+
+
+def _owned_project_ids(cursor, account_id: str) -> set[str]:
+    cursor.execute("SELECT id FROM projects WHERE owner_id = %s", (account_id,))
     return {row["id"] for row in cursor.fetchall()}
 
 
@@ -88,7 +140,7 @@ def serialize_row(table: str, row: dict, columns: tuple[str, ...] | None = None)
                 if column in UTC_COLUMNS
                 else value.isoformat(timespec="milliseconds")
             )
-        elif column == "is_secret":
+        elif column in {"is_secret", "is_group"}:
             payload[column] = bool(value)
         else:
             payload[column] = value
@@ -106,7 +158,7 @@ def deserialize_row(table: str, payload: dict, columns: tuple[str, ...]) -> dict
             row[column] = parse_iso_utc(value) if value else None
         elif column in WALL_CLOCK_COLUMNS:
             row[column] = _parse_naive(value)
-        elif column == "is_secret":
+        elif column in {"is_secret", "is_group"}:
             row[column] = 1 if value else 0
         else:
             row[column] = value
@@ -161,7 +213,8 @@ def read_changes(
             continue
         latest[(table, entry["row_id"])] = entry
 
-    visible = visible_project_ids(cursor, account_id)
+    visible, navigation, historical = project_scope_ids(cursor, account_id)
+    owned = _owned_project_ids(cursor, account_id)
     changes: list[dict] = []
     for (table, row_id), entry in latest.items():
         columns = (columns_by_table or {}).get(table) or table_columns(table)
@@ -177,7 +230,27 @@ def read_changes(
             continue
 
         project_id = _row_project_id(cursor, table, row)
-        if project_id is not None and project_id not in visible:
+        if table == "projects":
+            # 과거 멤버십은 live rename/metadata를 계속 볼 권한이 아니다. 단,
+            # project tombstone은 로컬 navigation을 숨기기 위해 전달한다.
+            if project_id not in visible | navigation and not (
+                project_id in historical and row.get("deleted_at") is not None
+            ):
+                continue
+        elif project_id in visible:
+            pass
+        elif table == "project_members" and (
+            row.get("user_id") == account_id and row.get("deleted_at") is not None
+        ):
+            # 본인의 membership 철회 tombstone만 예외다.
+            pass
+        elif project_id in owned and row.get("deleted_at") is not None:
+            # creator가 project를 삭제한 경우 이미 보유하던 memo/member tombstone을
+            # 복제해 로컬에서 되살아나지 않게 한다.
+            pass
+        elif project_id is not None:
+            # navigation-only parent는 row 자체만 보이고 그 안의 memo/member/version은
+            # 절대 change feed로 노출되지 않는다.
             continue
 
         changes.append(
@@ -191,6 +264,46 @@ def read_changes(
         )
 
     changes.sort(key=lambda change: change["seq"])
+
+    # child row가 이번 window에 있지만 parent는 과거 seq라면 새 복제본은 accordion을
+    # 만들 수 없다. parent의 탐색 metadata를 child seq에 dependency로 함께 보낸다.
+    included_projects = {
+        change["rowId"] for change in changes if change["table"] == "projects"
+    }
+    dependency_rows: list[dict] = []
+    for change in list(changes):
+        if change["table"] != "projects":
+            continue
+        parent_id = (change.get("row") or {}).get("parent_id")
+        if not parent_id or parent_id in included_projects or parent_id not in navigation:
+            continue
+        columns = (columns_by_table or {}).get("projects") or table_columns("projects")
+        cursor.execute(
+            f"SELECT {', '.join(columns)} FROM projects WHERE id = %s",
+            (parent_id,),
+        )
+        parent = cursor.fetchone()
+        cursor.execute(
+            "SELECT MAX(seq) AS seq FROM change_log WHERE table_name = 'projects' AND row_id = %s",
+            (parent_id,),
+        )
+        parent_seq = cursor.fetchone()["seq"]
+        if parent and parent_seq is not None:
+            dependency_rows.append(
+                {
+                    # 원래 parent outbox seq를 재사용한다. child seq를 복제하면 pull
+                    # daemon의 seq→result map에서 둘 중 하나가 유실된다.
+                    "seq": int(parent_seq),
+                    "table": "projects",
+                    "rowId": parent_id,
+                    "op": "update",
+                    "row": serialize_row("projects", parent, columns),
+                    "dependency": True,
+                }
+            )
+            included_projects.add(parent_id)
+    changes.extend(dependency_rows)
+    changes.sort(key=lambda change: (change["seq"], change["table"] != "projects"))
     return changes, next_seq
 
 

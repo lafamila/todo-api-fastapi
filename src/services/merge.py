@@ -43,6 +43,10 @@ def merge_memos(cursor, loser_id: str, winner_id: str) -> dict:
 
     loser = _load_memo(cursor, loser_id, "패자")
     winner = _load_memo(cursor, winner_id, "생존자")
+    if loser.get("kind") != "memo" or winner.get("kind") != "memo":
+        raise MergeError(409, "백로그는 일반 메모 병합으로 합칠 수 없습니다.")
+    if loser["project_id"] != winner["project_id"]:
+        raise MergeError(409, "서로 다른 프로젝트의 메모를 병합할 수 없습니다.")
 
     now = utcnow_naive()
     cursor.execute(
@@ -120,6 +124,12 @@ def merge_projects(cursor, loser_id: str, winner_id: str) -> dict:
 
     loser = _load_project(cursor, loser_id, "패자")
     winner = _load_project(cursor, winner_id, "생존자")
+    if bool(loser.get("is_group")) or bool(winner.get("is_group")):
+        raise MergeError(409, "그룹 프로젝트는 병합할 수 없습니다.")
+    if loser.get("parent_id") != winner.get("parent_id"):
+        raise MergeError(409, "서로 다른 계층의 프로젝트를 병합할 수 없습니다.")
+    if loser.get("owner_id") != winner.get("owner_id"):
+        raise MergeError(409, "소유자가 다른 프로젝트를 병합할 수 없습니다.")
     now = utcnow_naive()
 
     cursor.execute(
@@ -272,7 +282,15 @@ async def run_merge(kind: str, loser_id: str, winner_id: str) -> dict:
 
 def _load_memo(cursor, memo_id: str, label: str) -> dict:
     cursor.execute(
-        "SELECT id, project_id, title, content FROM memos WHERE id = %s AND deleted_at IS NULL",
+        """
+        SELECT m.id, m.project_id, m.kind, m.title, m.content
+        FROM memos m
+        JOIN projects p ON p.id = m.project_id
+        LEFT JOIN projects parent ON parent.id = p.parent_id
+        WHERE m.id = %s AND m.deleted_at IS NULL AND p.deleted_at IS NULL
+          AND p.is_group = 0
+          AND (p.parent_id IS NULL OR (parent.id IS NOT NULL AND parent.deleted_at IS NULL))
+        """,
         (memo_id,),
     )
     memo = cursor.fetchone()
@@ -283,7 +301,13 @@ def _load_memo(cursor, memo_id: str, label: str) -> dict:
 
 def _load_project(cursor, project_id: str, label: str) -> dict:
     cursor.execute(
-        "SELECT id, name FROM projects WHERE id = %s AND deleted_at IS NULL",
+        """
+        SELECT p.id, p.owner_id, p.parent_id, p.is_group, p.name
+        FROM projects p
+        LEFT JOIN projects parent ON parent.id = p.parent_id
+        WHERE p.id = %s AND p.deleted_at IS NULL
+          AND (p.parent_id IS NULL OR (parent.id IS NOT NULL AND parent.deleted_at IS NULL))
+        """,
         (project_id,),
     )
     project = cursor.fetchone()

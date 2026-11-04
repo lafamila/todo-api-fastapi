@@ -31,8 +31,11 @@ async def publish_article(
                        COALESCE(MAX(mv.version), 0) + 1 as current_version
                 FROM memos m
                 JOIN projects p ON m.project_id = p.id
+                LEFT JOIN projects parent ON parent.id = p.parent_id
                 LEFT JOIN memo_versions mv ON m.id = mv.memo_id
-                WHERE m.id = %s AND m.deleted_at IS NULL
+                WHERE m.id = %s AND m.deleted_at IS NULL AND m.kind = 'memo'
+                  AND p.deleted_at IS NULL AND p.is_group = 0
+                  AND (p.parent_id IS NULL OR (parent.id IS NOT NULL AND parent.deleted_at IS NULL))
                 GROUP BY m.id
             """,
                 (data.memoId,),
@@ -138,7 +141,11 @@ async def get_articles(projectId: Optional[str] = None, authorSlug: Optional[str
     """게시글 목록 조회 (프로젝트/게시자 slug별 필터 가능)"""
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            where = []
+            where = [
+                "p.deleted_at IS NULL",
+                "p.is_group = 0",
+                "(p.parent_id IS NULL OR (parent.id IS NOT NULL AND parent.deleted_at IS NULL))",
+            ]
             params = []
             if projectId:
                 where.append("a.project_id = %s")
@@ -154,6 +161,7 @@ async def get_articles(projectId: Optional[str] = None, authorSlug: Optional[str
                        p.name as project_name, p.icon as project_icon, p.is_secret
                 FROM articles a
                 JOIN projects p ON a.project_id = p.id
+                LEFT JOIN projects parent ON parent.id = p.parent_id
                 {where_sql}
                 ORDER BY a.published_at DESC
             """,
@@ -200,7 +208,9 @@ async def get_article(article_id: str):
                        p.name as project_name, p.icon as project_icon, p.is_secret
                 FROM articles a
                 JOIN projects p ON a.project_id = p.id
-                WHERE a.id = %s
+                LEFT JOIN projects parent ON parent.id = p.parent_id
+                WHERE a.id = %s AND p.deleted_at IS NULL AND p.is_group = 0
+                  AND (p.parent_id IS NULL OR (parent.id IS NOT NULL AND parent.deleted_at IS NULL))
             """,
                 (article_id,),
             )
@@ -237,7 +247,9 @@ async def delete_article(article_id: str, user: dict = Depends(require_admin)):
                 SELECT a.id, a.project_id, a.author_id, p.owner_id
                 FROM articles a
                 JOIN projects p ON a.project_id = p.id
-                WHERE a.id = %s
+                LEFT JOIN projects parent ON parent.id = p.parent_id
+                WHERE a.id = %s AND p.deleted_at IS NULL AND p.is_group = 0
+                  AND (p.parent_id IS NULL OR (parent.id IS NOT NULL AND parent.deleted_at IS NULL))
             """,
                 (article_id,),
             )
@@ -260,7 +272,15 @@ async def get_memo_article(memo_id: str, user: dict = Depends(get_current_user))
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT id, project_id FROM memos WHERE id = %s AND deleted_at IS NULL",
+                """
+                SELECT m.id, m.project_id
+                FROM memos m JOIN projects p ON p.id = m.project_id
+                LEFT JOIN projects parent ON parent.id = p.parent_id
+                WHERE m.id = %s AND m.deleted_at IS NULL
+                  AND p.deleted_at IS NULL AND p.is_group = 0
+                  AND (p.parent_id IS NULL OR
+                       (parent.id IS NOT NULL AND parent.deleted_at IS NULL))
+                """,
                 (memo_id,),
             )
             memo = cursor.fetchone()

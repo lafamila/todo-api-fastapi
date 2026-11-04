@@ -186,10 +186,16 @@ class _Cursor:
     def execute(self, query: str, params=None) -> None:
         normalized = " ".join(query.split())
         self.statements.append((normalized, params))
-        if normalized.startswith("SELECT id FROM projects"):
-            self.current = {"id": params[0]} if self.live else None
-        elif normalized.startswith("SELECT id FROM project_members"):
-            self.current = {"id": "member-1"} if self.member else None
+        if normalized.startswith("SELECT p.id, p.owner_id, p.parent_id, p.is_group"):
+            self.current = (
+                {"id": params[0], "owner_id": "owner", "parent_id": None, "is_group": 0}
+                if self.live else None
+            )
+        elif normalized.startswith("SELECT p.id, pm.id AS member_id"):
+            self.current = (
+                {"id": params[1], "member_id": "member-1" if self.member else None}
+                if self.live else None
+            )
         elif normalized.startswith("SELECT id, title, content FROM memos"):
             self.current = list(self.rows)
         else:  # pragma: no cover - catches contract drift explicitly
