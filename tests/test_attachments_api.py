@@ -50,8 +50,9 @@ OWNER = {
     "username": "attachment.owner",
     "display_name": "Attachment Owner",
     "email": "attachment.owner@example.test",
-    "permission": "admin",
+    "permission": "superadmin",
     "is_admin": True,
+    "is_super_admin": True,
 }
 OUTSIDER = {
     "id": "attachment-outsider",
@@ -239,6 +240,33 @@ class AttachmentApiIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as direct:
             await get_attachment_content(attachment_id, inline=False, user=OUTSIDER)
         self.assertIn(direct.exception.status_code, {403, 404})
+
+    async def test_members_can_download_existing_files_but_cannot_upload(self) -> None:
+        attachment_id = str(uuid.uuid4())
+        body = b"shared download remains available"
+        await self._upload(MEMO_ID, attachment_id, "shared.txt", body)
+        member = {**OUTSIDER, "id": "attachment-viewer"}
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """INSERT INTO project_members
+                       (id,project_id,user_id,role,invited_at,updated_at_utc)
+                       VALUES ('download-viewer',%s,%s,'viewer',%s,%s)""",
+                    (PROJECT_ID, member["id"], localnow_naive(), utcnow_naive()),
+                )
+        listed = await list_memo_attachments(MEMO_ID, member)
+        self.assertEqual([row["id"] for row in listed], [attachment_id])
+        downloaded = await download_memo_attachments(
+            MEMO_ID, DownloadAttachmentsRequest(attachmentIds=[attachment_id]), member,
+        )
+        self.assertEqual(await _streaming_body(downloaded), body)
+        for permission in ("owner", "admin", "user"):
+            with self.subTest(permission=permission), self.assertRaises(HTTPException) as denied:
+                await self._upload(
+                    MEMO_ID, str(uuid.uuid4()), "blocked.png", b"new bytes",
+                    user={**OWNER, "permission": permission},
+                )
+            self.assertEqual(denied.exception.status_code, 403)
 
     async def test_multiple_selection_returns_safe_zip_with_exact_bytes(self) -> None:
         payloads = []

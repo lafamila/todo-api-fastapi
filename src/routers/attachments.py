@@ -322,6 +322,8 @@ async def upload_memo_attachment(
     filename: str = Query(...),
     user: dict = Depends(get_current_user),
 ):
+    if user.get("permission") != "superadmin":
+        raise HTTPException(status_code=403, detail="Super admin access required for uploads")
     attachment_id = _validate_attachment_id(attachmentId)
     file_name = safe_file_name(filename)
     with get_db_connection() as conn:

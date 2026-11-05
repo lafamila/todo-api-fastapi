@@ -265,6 +265,9 @@ null/누락/빈 문자열이면 `loginId`와 `username`을 빈 문자열로 반�
   project merge에서도 object copy 없이 attachment association을 안전하게 옮긴다. 브라우저에는 key/bucket/
   credential을 노출하지 않고 인증 API만 제공한다. object key는 서버가
   `todo/memos/{originMemoId}/{attachmentId}`로 계산하며 private backlog 첨부는 parent memo privacy를 상속한다.
+- 새 파일·이미지 업로드 및 업로드 재시도는 service permission `superadmin`만 가능하며 기존 memo write
+  권한도 필요하다. 서비스 `owner`/`admin`·프로젝트 owner를 superadmin으로 대체하지 않는다.
+  목록·이미지 읽기·다운로드는 기존 memo read 권한을 유지한다. 버킷은 자동 생성하지 않는다.
 - 삭제는 정확한 프로젝트명 확인과 실제 `owner_id` 일치를 모두 요구한다. group은 현재 자식까지
   recursive tombstone 처리하되 프로젝트·메모·버전·게시글 행을 물리 삭제하지 않는다. 공개 게시글과
   REST/Socket.IO 직접 접근도 live ancestor를 확인한다.

@@ -4,6 +4,11 @@ Memo attachment metadata lives in MySQL and is synchronized with the Todo data.
 Object bodies live only in one shared private S3-compatible bucket. Browser
 responses never contain the bucket, object key, endpoint or credentials.
 
+신규 파일·클립보드 이미지 업로드와 업로드 재시도는 검증된 Todo service permission이
+정확히 `superadmin`인 계정만 사용할 수 있다. `owner`/`admin`이나 프로젝트 owner라는
+이유만으로 허용하지 않는다. 기존 메모 write/private-backlog 권한도 계속 적용한다.
+첨부 목록·이미지 조회·다운로드는 기존 메모 read 권한을 유지한다.
+
 ## Runtime configuration
 
 Attachment endpoints return HTTP 503 while
@@ -27,8 +32,13 @@ TODO_ATTACHMENT_UPLOAD_STALE_SECONDS=3600
 ```
 
 - Keep the R2 bucket private. Do not configure a public base URL or browser CORS.
-- 기존 Travel private R2 bucket을 그대로 사용하고 `todo/` prefix로 분리해도 된다.
-  새 유료 bucket을 만들 필요는 없으며, 두 Todo sync node에 동일한 bucket 설정을 넣는다.
+- `teddy-todo-prod-attachments`는 설정 예시이며 코드가 버킷을 자동 생성하지 않는다.
+  Travel과 다른 이름을 쓴다면 Cloudflare R2에서 해당 Todo 버킷을 먼저 생성해야 한다.
+  [버킷 생성 안내](https://developers.cloudflare.com/r2/buckets/create-buckets/)를 따른다.
+- 기존 Travel private R2 bucket을 그대로 쓰고 `todo/` prefix로 분리하는 경우에만
+  버킷 추가 생성이 필요 없다. 두 Todo sync node는 같은 Todo 버킷을 사용한다.
+- R2 토큰이 Travel 버킷만 허용한다면 Todo 버킷에 Object Read & Write 권한이 있는
+  별도 토큰을 발급하거나 권한 범위를 조정해야 한다. [R2 인증 안내](https://developers.cloudflare.com/r2/api/tokens/)
 - Give the credential object read/write access only to this bucket.
 - All Todo nodes that exchange attachment metadata must use the same bucket and
   the server-calculated `todo/memos/{originMemoId}/{attachmentId}` namespace.
@@ -39,6 +49,9 @@ TODO_ATTACHMENT_UPLOAD_STALE_SECONDS=3600
 - R2 무료 사용량은 Cloudflare 계정 전체에서 합산되며 무제한이 아니다. 현재
   한도와 초과 요금은 배포 전에 [Cloudflare R2 pricing](https://developers.cloudflare.com/r2/pricing/)
   에서 확인한다.
+- 2026-11-05 공식 요금표 기준 계정당 처음100,000개 버킷이 포함되므로 Todo용 버킷을 하나
+  추가할 수 있다. Standard 무료 사용량은 월10GB-month·Class A100만·Class B1,000만이며
+  Travel/Todo가 계정 전체 한도를 공유한다. 버킷별 무료 사용량이 새로 생기지 않는다.
 - The production gateway must accept at least 50 MiB request bodies. The root
   Todo gateway contract is `client_max_body_size 64m`; verify the NAS copy too.
 - Apply the API schema/sync-v4 release to both peers before enabling uploads.
@@ -49,6 +62,21 @@ TODO_ATTACHMENT_UPLOAD_STALE_SECONDS=3600
   older than `TODO_ATTACHMENT_UPLOAD_STALE_SECONDS` are opportunistically
   changed to `failed` during the next reservation, bounding abandoned slots
   without a background janitor.
+
+### Travel과 Todo 버킷을 분리할 때의 환경값
+
+| 환경변수 | 바뀌는 기준 |
+|---|---|
+| `S3_BUCKET_NAME` | 실제 생성한 Todo 버킷 이름으로 변경 |
+| `S3_ENDPOINT_URL` | 같은 Cloudflare 계정·관할이면 동일. EU/US/FedRAMP 지정 버킷은 해당 관할 endpoint 사용 |
+| `S3_REGION` | R2에서는 계속 `auto` |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | 기존 토큰이 Todo 버킷도 허용하면 재사용 가능. Todo 전용 토큰을 발급하면 새 값 사용 |
+| `STORAGE_BACKEND` | 둘 다 R2라면 `r2`로 동일 |
+
+버킷 생성이 접근키를 자동 발급하지는 않는다. Todo 버킷에만 Object Read & Write를 허용한
+전용 토큰을 권장하며, NAS/맥의 두 Todo API는 같은 버킷을 보되 각 키는 해당 버킷 권한이 있어야 한다.
+일반 endpoint/토큰 scope는 [R2 인증 문서](https://developers.cloudflare.com/r2/api/tokens/),
+`auto` region은 [S3 호환 문서](https://developers.cloudflare.com/r2/api/s3/api/)를 따른다.
 
 ## Local verification
 
