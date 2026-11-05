@@ -178,3 +178,5 @@ cython_debug/
 .omc/
 .omx/
 migration_artifacts/
+.build-artifacts-state.json
+.build-artifacts-staging/

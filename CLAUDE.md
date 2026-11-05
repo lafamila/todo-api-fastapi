@@ -534,3 +534,13 @@ import 순서에 의존하지 말고 반드시 `use_scratch_database()` 를 쓴�
 | Daily tasks | `routers/daily_tasks.py` | `/api/daily-tasks` prefix — `POST/GET/PUT/DELETE .../types[/{id}]`, `POST .../complete`, `DELETE .../complete/{typeId}/{date}`, `GET .../calendar[/{date}]` |
 
 Socket.IO realtime 서버(`services/realtime.py`)가 FastAPI app 을 ASGI wrap 한다. 전용 health 엔드포인트는 없다 (Docker HEALTHCHECK 는 `GET /docs` 사용).
+
+## Build Artifact Retention
+
+워크스페이스 `../CLAUDE.md`의 **원칙 25**를 따르며, 이 레포의 canonical 산출물 목록은 [`.build-artifacts.json`](./.build-artifacts.json)이다.
+
+- 기본 동작은 `$build-artifacts list`이며, 빌드와 정리는 명시적으로 `$build-artifacts build`, `$build-artifacts clean`을 사용한다. 파일 mtime만으로 빌드 성공을 추정하지 않는다.
+- 직전 성공 산출물은 다음 빌드와 산출물 검증이 모두 성공할 때까지 유지한다. 성공 후 같은 group에서 대체된 이전 산출물만 삭제하며, 실패하면 staging을 정리하고 직전 성공 상태로 복구한다.
+- platform/architecture/dev-prod/format variant와 `.app`/`.zip`/`.dmg`/symbols 같은 보완 형식은 각각 보존한다.
+- 소스, assets, DB/data, secrets, dependencies, cache, 실행 중인 산출물과 설치본은 정리 대상이 아니다.
+- 현재 Docker 빌드는 checkout 밖의 Docker image만 만들고 repo-local 배포 파일을 만들지 않으므로 manifest의 `groups`는 비어 있다. 데이터 export는 build artifact가 아니다.
