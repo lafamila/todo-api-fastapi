@@ -457,6 +457,11 @@ TODO_MODE=dev-local DB_HOST=127.0.0.1 AUTH_API_BASE_URL=http://localhost:3032 \
 
 ### 테스트
 
+프로젝트 목록 SQL은 운영과 같은 **MySQL 8 + ONLY_FULL_GROUP_BY**에서도
+`tests/test_project_listing.py`를 실행한다. MariaDB만으로는 SELECT DISTINCT와
+SELECT에 없는 부모 컬럼 ORDER BY의 오류3065를 잡을 수 없다. 현재 목록의 parent는 PK,
+멤버는 UNIQUE(project_id,user_id) 조인이므로 중복 제거용 DISTINCT가 필요하지 않다.
+
 ```bash
 venv/bin/python -m pytest tests/ -q          # 전체
 venv/bin/python -m pytest tests/test_mode_presets.py -q   # TODO_MODE 프리셋·preflight (DB 불필요)

@@ -208,8 +208,10 @@ async def get_projects(user: dict = Depends(get_current_user)):
                        ORDER BY COALESCE(parent.created_at, p.created_at), p.parent_id IS NOT NULL, p.created_at"""
                 )
             else:
+                # parent는 PK, pm은 UNIQUE(project_id, user_id) 조인이므로 중복이 없다.
+                # DISTINCT를 붙이면 MySQL 8에서 parent.created_at 정렬이 오류 3065가 된다.
                 cursor.execute(
-                    f"""SELECT DISTINCT {PROJECT_COLUMNS},
+                    f"""SELECT {PROJECT_COLUMNS},
                          CASE WHEN p.owner_id = %s THEN 'owner' ELSE pm.role END AS role,
                          CASE WHEN p.owner_id = %s OR pm.id IS NOT NULL THEN 0 ELSE 1 END AS navigation_only
                        FROM projects p
