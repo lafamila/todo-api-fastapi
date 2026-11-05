@@ -266,6 +266,75 @@ class HierarchySyncTests(unittest.TestCase):
             with conn.cursor() as cursor, self.assertRaises(HTTPException):
                 _authorize_sync_changes(cursor, [moved], ACCOUNT)
 
+    def test_actual_owner_can_move_regular_memo_across_owned_roots(self) -> None:
+        self.insert_project("source")
+        self.insert_project("target")
+        self.insert_memo("m", "source")
+        moved = change(
+            "memos", "m",
+            memo_row("m", "target", clock=BASE + timedelta(seconds=1)),
+        )
+        with get_db_connection(sync_applying=True) as conn:
+            with conn.cursor() as cursor:
+                _authorize_sync_changes(cursor, [moved], ACCOUNT)
+                outcome = apply_changes(cursor, [moved], SIDE_CLIENT)
+        self.assertEqual(outcome.applied, 1)
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT project_id FROM memos WHERE id='m'")
+                self.assertEqual(cursor.fetchone()["project_id"], "target")
+
+    def test_cross_root_backlog_move_is_rejected_by_auth_and_apply(self) -> None:
+        self.insert_project("source")
+        self.insert_project("target")
+        self.insert_memo("backlog", "source", kind="backlog")
+        moved = change(
+            "memos", "backlog",
+            memo_row(
+                "backlog", "target", kind="backlog",
+                clock=BASE + timedelta(seconds=1),
+            ),
+        )
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor, self.assertRaises(HTTPException):
+                _authorize_sync_changes(cursor, [moved], ACCOUNT)
+        with get_db_connection(sync_applying=True) as conn:
+            with conn.cursor() as cursor:
+                outcome = apply_changes(cursor, [moved], SIDE_CLIENT)
+        self.assertEqual(
+            outcome.rejected[0]["reason"], "backlog_manual_move_forbidden"
+        )
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT project_id FROM memos WHERE id='backlog'")
+                self.assertEqual(cursor.fetchone()["project_id"], "source")
+
+    def test_first_child_batch_moves_backlog_with_group_transition(self) -> None:
+        self.insert_project("root")
+        self.insert_memo("backlog", "root", kind="backlog", content="preserved")
+        clock = BASE + timedelta(seconds=1)
+        batch = [
+            change("projects", "root", project_row("root", is_group=True, clock=clock), 1),
+            change("projects", "child", project_row("child", parent_id="root", clock=clock), 2),
+            change(
+                "memos", "backlog",
+                memo_row("backlog", "child", kind="backlog", content="preserved", clock=clock),
+                3,
+            ),
+        ]
+        with get_db_connection(sync_applying=True) as conn:
+            with conn.cursor() as cursor:
+                _authorize_sync_changes(cursor, batch, ACCOUNT)
+                outcome = apply_changes(cursor, batch, SIDE_CLIENT)
+        self.assertFalse(outcome.rejected)
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT project_id,content,kind FROM memos WHERE id='backlog'")
+                self.assertEqual(
+                    cursor.fetchone(),
+                    {"project_id": "child", "content": "preserved", "kind": "backlog"},
+                )
+
     def test_memo_kind_is_valid_and_immutable_through_raw_push(self) -> None:
         self.insert_project("leaf")
         self.insert_memo("m", "leaf")

@@ -567,6 +567,15 @@ def _root_id(project: dict | None) -> str | None:
     return project.get("parent_id") or project.get("id")
 
 
+def _root_shape(cursor, project: dict | None) -> dict | None:
+    root_id = _root_id(project)
+    if root_id is None:
+        return None
+    if project and project.get("id") == root_id:
+        return project
+    return _project_shape(cursor, str(root_id))
+
+
 def normalize_hierarchy_row(
     cursor,
     table: str,
@@ -642,8 +651,25 @@ def normalize_hierarchy_row(
 
         if existing is not None and existing.get("project_id") != normalized.get("project_id"):
             source = _project_shape(cursor, existing.get("project_id"))
-            if _root_id(source) != _root_id(target):
-                return normalized, None, "cross_root_memo_move_forbidden"
+            if kind == "backlog" and not bool(
+                source
+                and target
+                and not source.get("parent_id")
+                and bool(source.get("is_group"))
+                and source.get("deleted_at") is None
+                and target.get("parent_id") == source.get("id")
+            ):
+                return normalized, None, "backlog_manual_move_forbidden"
+            source_root = _root_shape(cursor, source)
+            target_root = _root_shape(cursor, target)
+            if (
+                source_root is None
+                or target_root is None
+                or source_root.get("deleted_at") is not None
+                or target_root.get("deleted_at") is not None
+                or source_root.get("owner_id") != target_root.get("owner_id")
+            ):
+                return normalized, None, "cross_root_memo_owner_mismatch"
         return normalized, None, None
 
     if table == "project_members":

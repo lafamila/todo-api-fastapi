@@ -12,6 +12,10 @@ class CreateProjectRequest(BaseModel):
     parentProjectId: Optional[str] = None
 
 
+class UpdateProjectRequest(BaseModel):
+    name: str
+
+
 class CreateMemoRequest(BaseModel):
     projectId: str
     title: str
@@ -36,6 +40,14 @@ class VerifyPasswordRequest(BaseModel):
 
 class BulkDeleteMemosRequest(BaseModel):
     memoIds: List[str]
+
+
+class BulkMoveMemosRequest(BaseModel):
+    memoIds: List[str]
+    sourceProjectId: str
+    targetProjectId: str
+    sourceConfirmationName: str
+    targetConfirmationName: str
 
 
 class LoginRequest(BaseModel):

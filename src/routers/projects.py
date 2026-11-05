@@ -3,7 +3,13 @@ from fastapi import APIRouter, Depends, HTTPException
 try:
     from ..auth_utils import get_current_user, require_admin
     from ..connectors import get_db_connection
-    from ..models.base import CreateProjectRequest, DeleteProjectRequest, InviteMemberRequest, VerifyPasswordRequest
+    from ..models.base import (
+        CreateProjectRequest,
+        DeleteProjectRequest,
+        InviteMemberRequest,
+        UpdateProjectRequest,
+        VerifyPasswordRequest,
+    )
     from ..services.merge import MergeError, run_merge
     from ..services.realtime import get_realtime_server
     from ..timeutil import iso_utc, localnow_naive, utcnow_naive
@@ -11,7 +17,13 @@ try:
 except ImportError:  # pragma: no cover
     from auth_utils import get_current_user, require_admin
     from connectors import get_db_connection
-    from models.base import CreateProjectRequest, DeleteProjectRequest, InviteMemberRequest, VerifyPasswordRequest
+    from models.base import (
+        CreateProjectRequest,
+        DeleteProjectRequest,
+        InviteMemberRequest,
+        UpdateProjectRequest,
+        VerifyPasswordRequest,
+    )
     from services.merge import MergeError, run_merge
     from services.realtime import get_realtime_server
     from timeutil import iso_utc, localnow_naive, utcnow_naive
@@ -325,6 +337,62 @@ async def create_project(data: CreateProjectRequest, user: dict = Depends(get_cu
         "is_group": False, "role": "owner", "navigation_only": False,
         "created_at": now, "updated_at": now, "updated_at_utc": now_utc,
     }, user)
+    realtime = get_realtime_server()
+    if realtime is not None and realtime.available:
+        await realtime.emit_projects_changed()
+    return result
+
+
+@router.patch("/{project_id}")
+async def rename_project(
+    project_id: str,
+    data: UpdateProjectRequest,
+    user: dict = Depends(get_current_user),
+):
+    """프로젝트 owner가 그룹/leaf 이름만 변경한다."""
+    name = data.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="Project name cannot be empty")
+    if len(name) > 255:
+        raise HTTPException(status_code=422, detail="Project name must be 255 characters or fewer")
+
+    now, now_utc = localnow_naive(), utcnow_naive()
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            project = _require_live_project(cursor, project_id, for_update=True)
+            if not can_manage_project(cursor, project_id, user):
+                raise HTTPException(status_code=403, detail="Only project owner can rename it")
+            cursor.execute(
+                """
+                SELECT id FROM projects
+                WHERE parent_id <=> %s AND name = %s AND id <> %s AND deleted_at IS NULL
+                LIMIT 1
+                """,
+                (project["parent_id"], name, project_id),
+            )
+            duplicate = cursor.fetchone()
+            if duplicate:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "동일한 이름의 프로젝트가 이미 존재합니다.",
+                        "existingProjectId": duplicate["id"],
+                    },
+                )
+            cursor.execute(
+                "UPDATE projects SET name = %s, updated_at = %s, updated_at_utc = %s WHERE id = %s",
+                (name, now, now_utc, project_id),
+            )
+            project.update(
+                {
+                    "name": name,
+                    "updated_at": now,
+                    "updated_at_utc": now_utc,
+                    "role": "owner",
+                    "navigation_only": False,
+                }
+            )
+            result = _serialize_project(project, user)
     realtime = get_realtime_server()
     if realtime is not None and realtime.available:
         await realtime.emit_projects_changed()

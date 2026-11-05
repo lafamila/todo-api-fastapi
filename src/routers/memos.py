@@ -9,6 +9,7 @@ try:
     from ..connectors import get_db_connection
     from ..models.base import (
         BulkDeleteMemosRequest,
+        BulkMoveMemosRequest,
         CreateMemoRequest,
         MoveMemoRequest,
         UpdateMemoRequest,
@@ -23,6 +24,7 @@ except ImportError:  # pragma: no cover
     from connectors import get_db_connection
     from models.base import (
         BulkDeleteMemosRequest,
+        BulkMoveMemosRequest,
         CreateMemoRequest,
         MoveMemoRequest,
         UpdateMemoRequest,
@@ -114,7 +116,7 @@ def _require_live_project(cursor, project_id: str, *, for_update: bool = False) 
     suffix = " FOR UPDATE" if for_update else ""
     cursor.execute(
         f"""
-        SELECT p.id, p.owner_id, p.parent_id, p.is_group
+        SELECT p.id, p.owner_id, p.parent_id, p.is_group, p.name
         FROM projects p LEFT JOIN projects parent ON parent.id = p.parent_id
         WHERE p.id = %s AND p.deleted_at IS NULL
           AND (p.parent_id IS NULL OR (parent.id IS NOT NULL AND parent.deleted_at IS NULL))
@@ -133,6 +135,41 @@ def _require_leaf_project(cursor, project_id: str, *, for_update: bool = False) 
     if project["is_group"]:
         raise HTTPException(status_code=409, detail="Group projects cannot contain memos")
     return project
+
+
+def _lock_owned_move_projects(
+    cursor,
+    source_project_id: str,
+    target_project_id: str,
+    user_id: str,
+) -> tuple[dict, dict]:
+    """root→leaf 고정 순서로 잠그고 양쪽 실제 root owner를 검증한다."""
+    initial = {
+        project_id: _require_leaf_project(cursor, project_id)
+        for project_id in {source_project_id, target_project_id}
+    }
+    root_ids = {
+        str(project.get("parent_id") or project["id"])
+        for project in initial.values()
+    }
+    roots: dict[str, dict] = {}
+    for root_id in sorted(root_ids):
+        root = _require_live_project(cursor, root_id, for_update=True)
+        if root.get("parent_id") is not None:
+            raise HTTPException(status_code=422, detail="Project hierarchy is invalid")
+        roots[root_id] = root
+    if any(root["owner_id"] != user_id for root in roots.values()):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the actual owner of both project roots can move memos",
+        )
+
+    locked: dict[str, dict] = {}
+    for project_id in sorted({source_project_id, target_project_id}):
+        locked[project_id] = _require_leaf_project(
+            cursor, project_id, for_update=True
+        )
+    return locked[source_project_id], locked[target_project_id]
 
 
 def _require_memo_write_lease(
@@ -365,39 +402,35 @@ async def move_memo(
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT id, project_id, kind, title FROM memos WHERE id = %s AND deleted_at IS NULL FOR UPDATE",
+                "SELECT id, project_id, kind, title FROM memos WHERE id = %s AND deleted_at IS NULL",
+                (memo_id,),
+            )
+            initial_memo = cursor.fetchone()
+            if not initial_memo:
+                raise HTTPException(status_code=404, detail="Memo not found")
+            if initial_memo["kind"] == "backlog":
+                raise HTTPException(status_code=422, detail="Backlogs cannot be moved manually")
+            source_project_id = initial_memo["project_id"]
+            source, target = _lock_owned_move_projects(
+                cursor, source_project_id, data.targetProjectId, user["id"]
+            )
+            if not source.get("parent_id") or source.get("parent_id") != target.get("parent_id"):
+                raise HTTPException(status_code=422, detail="Memos can only move between sibling subprojects")
+            if data.targetProjectId == source_project_id:
+                raise HTTPException(status_code=409, detail="Memo is already in the target project")
+            cursor.execute(
+                "SELECT id, project_id, kind, title FROM memos "
+                "WHERE id = %s AND deleted_at IS NULL FOR UPDATE",
                 (memo_id,),
             )
             memo = cursor.fetchone()
-            if not memo:
-                raise HTTPException(status_code=404, detail="Memo not found")
-            if memo["kind"] == "backlog":
+            if not memo or memo["project_id"] != source_project_id:
+                raise HTTPException(status_code=409, detail="Memo project changed during move")
+            if memo["kind"] != "memo":
                 raise HTTPException(status_code=422, detail="Backlogs cannot be moved manually")
             cursor.execute(
-                """
-                SELECT source.parent_id AS source_parent, target.parent_id AS target_parent,
-                       parent.owner_id AS root_owner_id
-                FROM projects source
-                JOIN projects target ON target.id = %s AND target.deleted_at IS NULL
-                JOIN projects parent ON parent.id = source.parent_id AND parent.deleted_at IS NULL
-                WHERE source.id = %s AND source.deleted_at IS NULL
-                """,
-                (data.targetProjectId, memo["project_id"]),
-            )
-            lineage = cursor.fetchone()
-            if (
-                not lineage
-                or not lineage["source_parent"]
-                or lineage["source_parent"] != lineage["target_parent"]
-            ):
-                raise HTTPException(status_code=422, detail="Memos can only move between sibling subprojects")
-            if lineage["root_owner_id"] != user["id"]:
-                raise HTTPException(status_code=403, detail="Only the root project creator can move memos")
-            if data.targetProjectId == memo["project_id"]:
-                raise HTTPException(status_code=409, detail="Memo is already in the target project")
-            cursor.execute(
                 "SELECT id FROM memos WHERE project_id = %s AND kind = 'memo' "
-                "AND title = %s AND id <> %s AND deleted_at IS NULL LIMIT 1",
+                "AND title = %s AND id <> %s AND deleted_at IS NULL LIMIT 1 FOR UPDATE",
                 (data.targetProjectId, memo["title"], memo_id),
             )
             duplicate = cursor.fetchone()
@@ -419,6 +452,114 @@ async def move_memo(
     realtime = get_realtime_server()
     if realtime is not None and realtime.available:
         await realtime.revalidate_memo_access(memo_id)
+        await realtime.emit_projects_changed()
+    return result
+
+
+@router.post("/memos/bulk-move")
+async def bulk_move_memos(
+    data: BulkMoveMemosRequest,
+    user: dict = Depends(get_current_user),
+):
+    """양쪽 root의 실제 owner가 확인 이름과 함께 선택 메모 전체를 원자적으로 이동한다."""
+    if not data.memoIds:
+        raise HTTPException(status_code=400, detail="memoIds cannot be empty")
+    if len(set(data.memoIds)) != len(data.memoIds):
+        raise HTTPException(status_code=422, detail="memoIds must not contain duplicates")
+    if data.sourceProjectId == data.targetProjectId:
+        raise HTTPException(status_code=422, detail="Source and target projects must differ")
+
+    now_utc = utcnow_naive()
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            source, target = _lock_owned_move_projects(
+                cursor, data.sourceProjectId, data.targetProjectId, user["id"]
+            )
+            if data.sourceConfirmationName != source["name"]:
+                raise HTTPException(status_code=422, detail="Source project name confirmation does not match")
+            if data.targetConfirmationName != target["name"]:
+                raise HTTPException(status_code=422, detail="Target project name confirmation does not match")
+
+            placeholders = ", ".join(["%s"] * len(data.memoIds))
+            cursor.execute(
+                f"""
+                SELECT {MEMO_COLUMNS}, deleted_at
+                FROM memos
+                WHERE id IN ({placeholders})
+                ORDER BY id
+                FOR UPDATE
+                """,
+                tuple(data.memoIds),
+            )
+            selected = cursor.fetchall()
+            by_id = {memo["id"]: memo for memo in selected}
+            if set(by_id) != set(data.memoIds):
+                raise HTTPException(status_code=404, detail="One or more memos were not found")
+            if any(memo["deleted_at"] is not None for memo in selected):
+                raise HTTPException(status_code=404, detail="One or more memos were not found")
+            if any(memo.get("kind") != "memo" for memo in selected):
+                raise HTTPException(status_code=422, detail="Only regular memos can be moved")
+            if any(memo["project_id"] != data.sourceProjectId for memo in selected):
+                raise HTTPException(status_code=422, detail="Every memo must belong to the source project")
+
+            titles = [memo["title"] for memo in selected]
+            cursor.execute(
+                f"""
+                SELECT title FROM memos WHERE id IN ({placeholders})
+                GROUP BY title HAVING COUNT(*) > 1 LIMIT 1
+                """,
+                tuple(data.memoIds),
+            )
+            if cursor.fetchone():
+                raise HTTPException(status_code=409, detail="Selected memos contain duplicate titles")
+            title_placeholders = ", ".join(["%s"] * len(titles))
+            cursor.execute(
+                f"""
+                SELECT id, title FROM memos
+                WHERE project_id = %s AND kind = 'memo' AND deleted_at IS NULL
+                  AND title IN ({title_placeholders})
+                LIMIT 1 FOR UPDATE
+                """,
+                (data.targetProjectId, *titles),
+            )
+            collision = cursor.fetchone()
+            if collision:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "동일한 제목의 메모가 대상 프로젝트에 이미 존재합니다.",
+                        "existingMemoId": collision["id"],
+                        "title": collision["title"],
+                    },
+                )
+
+            cursor.execute(
+                f"""
+                UPDATE memos
+                SET project_id = %s, updated_at = updated_at, updated_at_utc = %s
+                WHERE id IN ({placeholders})
+                """,
+                (data.targetProjectId, now_utc, *data.memoIds),
+            )
+            if cursor.rowcount != len(data.memoIds):
+                raise RuntimeError("bulk memo move changed an unexpected row count")
+            cursor.execute(
+                f"UPDATE articles SET project_id = %s WHERE memo_id IN ({placeholders})",
+                (data.targetProjectId, *data.memoIds),
+            )
+            cursor.execute(
+                f"SELECT {MEMO_COLUMNS} FROM memos WHERE id IN ({placeholders})",
+                tuple(data.memoIds),
+            )
+            moved_by_id = {
+                memo["id"]: _serialize_memo(memo) for memo in cursor.fetchall()
+            }
+            result = {"movedMemos": [moved_by_id[memo_id] for memo_id in data.memoIds]}
+
+    realtime = get_realtime_server()
+    if realtime is not None and realtime.available:
+        for memo_id in data.memoIds:
+            await realtime.revalidate_memo_access(memo_id)
         await realtime.emit_projects_changed()
     return result
 

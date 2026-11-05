@@ -387,6 +387,62 @@ def _root_project_id(
     return str(project.get("parent_id") or project["id"])
 
 
+def _actual_live_root_owner(
+    cursor, root_id: str | None, incoming_projects: dict[str, dict]
+) -> str | None:
+    """role row가 아니라 root project의 실제 owner_id만 반환한다."""
+    if not root_id:
+        return None
+    incoming = incoming_projects.get(root_id)
+    if incoming is not None:
+        if incoming.get("parent_id") or incoming.get("deleted_at") is not None:
+            return None
+        owner_id = incoming.get("owner_id")
+        return str(owner_id) if owner_id else None
+    cursor.execute(
+        "SELECT owner_id, parent_id, deleted_at FROM projects WHERE id = %s",
+        (root_id,),
+    )
+    root = cursor.fetchone()
+    if not root or root.get("parent_id") or root.get("deleted_at") is not None:
+        return None
+    owner_id = root.get("owner_id")
+    return str(owner_id) if owner_id else None
+
+
+def _is_backlog_group_migration(
+    cursor,
+    source_project_id: str,
+    target_project_id: str,
+    incoming_projects: dict[str, dict],
+) -> bool:
+    """first-child 전환 또는 뒤늦은 pull에서 group root backlog 이동만 허용한다."""
+    source = incoming_projects.get(source_project_id)
+    if source is None:
+        cursor.execute(
+            "SELECT id, parent_id, is_group, deleted_at FROM projects WHERE id = %s",
+            (source_project_id,),
+        )
+        source = cursor.fetchone()
+    target = incoming_projects.get(target_project_id)
+    if target is None:
+        cursor.execute(
+            "SELECT id, parent_id, is_group, deleted_at FROM projects WHERE id = %s",
+            (target_project_id,),
+        )
+        target = cursor.fetchone()
+    return bool(
+        source
+        and target
+        and not source.get("parent_id")
+        and bool(source.get("is_group"))
+        and source.get("deleted_at") is None
+        and target.get("parent_id") == source_project_id
+        and not bool(target.get("is_group"))
+        and target.get("deleted_at") is None
+    )
+
+
 def _authorize_sync_changes(
     cursor,
     payload: list[dict],
@@ -551,13 +607,30 @@ def _authorize_sync_changes(
         if table == "memos":
             incoming_project = row.get("project_id") or existing_project
             if existing_project and incoming_project and existing_project != incoming_project:
+                cursor.execute("SELECT kind FROM memos WHERE id = %s", (row_id,))
+                existing_memo = cursor.fetchone()
+                move_kind = row.get("kind") or (existing_memo or {}).get("kind") or "memo"
+                if move_kind != "memo" and not _is_backlog_group_migration(
+                    cursor,
+                    str(existing_project),
+                    str(incoming_project),
+                    incoming_projects,
+                ):
+                    raise _forbidden_change(
+                        table, row_id, "backlog_manual_move_forbidden"
+                    )
                 source_root = _root_project_id(
                     cursor, str(existing_project), incoming_projects
                 )
                 target_root = _root_project_id(
                     cursor, str(incoming_project), incoming_projects
                 )
-                if source_root != target_root or role_for(source_root) != "owner":
+                if (
+                    _actual_live_root_owner(cursor, source_root, incoming_projects)
+                    != account_id
+                    or _actual_live_root_owner(cursor, target_root, incoming_projects)
+                    != account_id
+                ):
                     raise _forbidden_change(
                         table, row_id, "memo_move_requires_root_owner"
                     )

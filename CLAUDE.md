@@ -247,8 +247,13 @@ null/누락/빈 문자열이면 `loginId`와 `username`을 빈 문자열로 반�
 - group root는 탐색/아코디언 전용이며 메모·백로그를 만들거나 나열하지 않는다. 자식만 초대된 사용자는
   부모를 `navigationOnly` 메타데이터로만 받고 부모 멤버·본문 권한은 얻지 않는다.
 - root 초대는 현재 자식 전체 또는 명시된 일부 자식에만 snapshot으로 복제한다. 미래 자식에는 전파하지 않는다.
-- 일반 메모 이동은 같은 root의 두 live 자식 사이에서 실제 root creator만 가능하다. 메모/버전 ID와
-  content 편집시각을 보존하고 접근권한이 사라진 Socket.IO room/lease는 commit 직후 재검증한다.
+- 단일 일반 메모 이동은 같은 root의 두 live 자식 사이에서 실제 root creator만 가능하다. 다중 이동은
+  source/target leaf 이름을 정확히 재입력하고 양쪽 root의 실제 `owner_id`가 사용자와 같으면 서로 다른
+  root 사이도 가능하다. root→leaf→memo 고정 잠금 순서로 전체 검증·제목 충돌 검사 후 한 transaction에서
+  이동한다. 메모/버전 ID와 content `updated_at`을 보존하고 article 참조를 옮기며, commit 뒤 Socket.IO
+  room/lease를 재검증한다. sync raw move도 양쪽 실제 root owner가 같을 때만 cross-root를 허용한다.
+- `PATCH /api/projects/{id}`는 owner 역할만 이름을 변경하며 공백/255자 초과/같은 hierarchy scope 중복을
+  거부한다. `updated_at`(KST)과 `updated_at_utc`(sync clock)를 함께 갱신하고 관계·멤버십은 바꾸지 않는다.
 - 새 leaf는 생성 트랜잭션에서 결정적 ID의 빈 `kind=backlog` 메모를 함께 만들고, 기존 leaf는
   원자적 get-or-create로 복구한다. leaf마다 live backlog는 최대 하나다. 저장·version·lease·CAS는
   일반 메모 계약을 그대로 사용하며 일반 메모 목록/검색/게시/수동 이동에서는 제외한다.
@@ -501,8 +506,8 @@ import 순서에 의존하지 말고 반드시 `use_scratch_database()` 를 쓴�
 | Category | Router | Routes |
 |----------|--------|--------|
 | Auth/session | `routers/auth.py` | `POST /api/session/oidc/start`, `POST /api/session/logout`, `GET /api/session/me`, `POST /api/session/local`(오프라인 로그인), `GET /api/session/local/identity`, `POST /api/session/service-application`, `GET /api/users/search`, `POST /api/livekit/token` |
-| Projects | `routers/projects.py` | `GET/POST /api/projects`(parentProjectId로 자식 생성), `DELETE /api/projects/{id}`(이름확인·recursive soft), `POST /api/projects/{id}/verify`, 병합 `POST /api/projects/{loserId}/merge-into/{winnerId}`, 멤버 snapshot 초대 `GET/POST /api/projects/{id}/members`, `DELETE /api/projects/{id}/members/{userId}`(soft) |
-| Memos | `routers/memos.py` | `GET /api/projects/{id}/memos`, `GET/POST /api/projects/{id}/backlog`, `POST /api/memos`, `GET/PUT/DELETE /api/memos/{id}`, `POST /api/memos/{id}/move`, `POST /api/memos/bulk-delete`, 버전 `GET /api/memos/{id}/versions[/{v}]`, 병합 `POST /api/memos/{loserId}/merge-into/{winnerId}` |
+| Projects | `routers/projects.py` | `GET/POST /api/projects`(parentProjectId로 자식 생성), `PATCH /api/projects/{id}`(owner rename), `DELETE /api/projects/{id}`(이름확인·recursive soft), `POST /api/projects/{id}/verify`, 병합 `POST /api/projects/{loserId}/merge-into/{winnerId}`, 멤버 snapshot 초대 `GET/POST /api/projects/{id}/members`, `DELETE /api/projects/{id}/members/{userId}`(soft) |
+| Memos | `routers/memos.py` | `GET /api/projects/{id}/memos`, `GET/POST /api/projects/{id}/backlog`, `POST /api/memos`, `GET/PUT/DELETE /api/memos/{id}`, `POST /api/memos/{id}/move`, `POST /api/memos/bulk-move`, `POST /api/memos/bulk-delete`, 버전 `GET /api/memos/{id}/versions[/{v}]`, 병합 `POST /api/memos/{loserId}/merge-into/{winnerId}` |
 | Sync | `routers/sync.py` | 피어: `handshake`·`changes`·`push`·`locks/*`·`merge/*` (service credential) / UI: `status`·`issues`·`issues/resolve`·`pause`·`trigger` (세션) |
 | Articles | `routers/articles.py` | `POST/GET /api/articles`, `GET /api/articles/boards/{slug}`, `GET/DELETE /api/articles/{id}`, `GET /api/memos/{id}/article` |
 | Daily tasks | `routers/daily_tasks.py` | `/api/daily-tasks` prefix — `POST/GET/PUT/DELETE .../types[/{id}]`, `POST .../complete`, `DELETE .../complete/{typeId}/{date}`, `GET .../calendar[/{date}]` |
