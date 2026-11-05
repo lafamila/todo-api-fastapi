@@ -763,8 +763,13 @@ def _authorize_sync_changes(
             continue
 
         if table == "memo_attachments":
+            if change.get("op") == "delete":
+                raise _forbidden_change(
+                    table, row_id, "attachment_hard_delete_forbidden"
+                )
             cursor.execute(
-                "SELECT memo_id, created_by FROM memo_attachments WHERE id = %s",
+                "SELECT memo_id, created_by, deleted_at "
+                "FROM memo_attachments WHERE id = %s",
                 (row_id,),
             )
             existing_attachment = cursor.fetchone()
@@ -772,6 +777,22 @@ def _authorize_sync_changes(
             attachment_creator = row.get("created_by") or (
                 existing_attachment or {}
             ).get("created_by")
+            incoming_deleted_at = row.get("deleted_at")
+            incoming_is_deleted = bool(
+                incoming_deleted_at is not None
+                and str(incoming_deleted_at).strip()
+            )
+            if (
+                existing_attachment is not None
+                and existing_attachment.get("deleted_at") is not None
+                and not incoming_is_deleted
+            ):
+                raise _forbidden_change(
+                    table, row_id, "attachment_undelete_forbidden"
+                )
+            own_tombstone = bool(
+                incoming_is_deleted and attachment_creator == account_id
+            )
             memo = _memo_for_sync_authorization(cursor, memo_id, incoming_memos)
             if not memo:
                 raise _forbidden_change(table, row_id, "attachment_memo_missing")
@@ -822,6 +843,15 @@ def _authorize_sync_changes(
                 ) not in {"owner", "editor", "viewer"}:
                     raise _forbidden_change(
                         table, row_id, "private_backlog_owner_mismatch"
+                    )
+            elif own_tombstone:
+                if explicit_role_for(str(project_id)) not in {
+                    "owner",
+                    "editor",
+                    "viewer",
+                }:
+                    raise _forbidden_change(
+                        table, row_id, "attachment_delete_membership_required"
                     )
             elif role_for(str(project_id)) not in {"owner", "editor"}:
                 raise _forbidden_change(table, row_id)

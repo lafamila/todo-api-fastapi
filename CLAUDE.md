@@ -268,6 +268,9 @@ null/누락/빈 문자열이면 `loginId`와 `username`을 빈 문자열로 반�
 - 새 파일·이미지 업로드 및 업로드 재시도는 service permission `superadmin`만 가능하며 기존 memo write
   권한도 필요하다. 서비스 `owner`/`admin`·프로젝트 owner를 superadmin으로 대체하지 않는다.
   목록·이미지 읽기·다운로드는 기존 memo read 권한을 유지한다. 버킷은 자동 생성하지 않는다.
+- 첨부 batch 삭제는 현재 live memo의 실제 read 멤버십과 정확한 `created_by == user.id`를 모두 요구한다.
+  관리자 우회는 없으며 uploader가 viewer로 변경돼도 자기 파일은 삭제 가능하다. 전체 ID를 검증한 뒤 한 transaction으로
+  metadata tombstone을 남기고 기존 sync v4로 전파한다. R2 객체는 삭제하지 않으며 raw sync hard-delete/undelete도 금지한다.
 - 삭제는 정확한 프로젝트명 확인과 실제 `owner_id` 일치를 모두 요구한다. group은 현재 자식까지
   recursive tombstone 처리하되 프로젝트·메모·버전·게시글 행을 물리 삭제하지 않는다. 공개 게시글과
   REST/Socket.IO 직접 접근도 live ancestor를 확인한다.
@@ -525,7 +528,7 @@ import 순서에 의존하지 말고 반드시 `use_scratch_database()` 를 쓴�
 | Auth/session | `routers/auth.py` | `POST /api/session/oidc/start`, `POST /api/session/logout`, `GET /api/session/me`, `POST /api/session/local`(오프라인 로그인), `GET /api/session/local/identity`, `POST /api/session/service-application`, `GET /api/users/search`, `POST /api/livekit/token` |
 | Projects | `routers/projects.py` | `GET/POST /api/projects`(parentProjectId로 자식 생성), `PATCH /api/projects/{id}`(owner rename), `DELETE /api/projects/{id}`(이름확인·recursive soft), `POST /api/projects/{id}/verify`, 병합 `POST /api/projects/{loserId}/merge-into/{winnerId}`, 멤버 snapshot 초대 `GET/POST /api/projects/{id}/members`, `DELETE /api/projects/{id}/members/{userId}`(soft) |
 | Memos | `routers/memos.py` | `GET /api/projects/{id}/memos`, `GET/POST /api/projects/{id}/backlog`, `POST /api/memos`, `GET/PUT/DELETE /api/memos/{id}`, `POST /api/memos/{id}/move`, `POST /api/memos/bulk-move`, `POST /api/memos/bulk-delete`, 버전 `GET /api/memos/{id}/versions[/{v}]`, 병합 `POST /api/memos/{loserId}/merge-into/{winnerId}` |
-| Attachments | `routers/attachments.py` | `GET/POST /api/memos/{id}/attachments`, `POST /api/memos/{id}/attachments/download`, `GET /api/attachments/{id}/content` — private storage proxy, single original/multi ZIP |
+| Attachments | `routers/attachments.py` | `GET/POST /api/memos/{id}/attachments`, `POST .../attachments/download`, `POST .../attachments/delete`(업로더 본인 batch tombstone), `GET /api/attachments/{id}/content` — private storage proxy, single original/multi ZIP |
 | Sync | `routers/sync.py` | 피어: `handshake`·`changes`·`push`·`locks/*`·`merge/*` (service credential) / UI: `status`·`issues`·`issues/resolve`·`pause`·`trigger` (세션) |
 | Articles | `routers/articles.py` | `POST/GET /api/articles`, `GET /api/articles/boards/{slug}`, `GET/DELETE /api/articles/{id}`, `GET /api/memos/{id}/article` |
 | Daily tasks | `routers/daily_tasks.py` | `/api/daily-tasks` prefix — `POST/GET/PUT/DELETE .../types[/{id}]`, `POST .../complete`, `DELETE .../complete/{typeId}/{date}`, `GET .../calendar[/{date}]` |

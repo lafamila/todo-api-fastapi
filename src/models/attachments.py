@@ -21,3 +21,12 @@ class MemoAttachment(BaseModel):
 
 class DownloadAttachmentsRequest(BaseModel):
     attachmentIds: list[str] = Field(min_length=1)
+
+
+class DeleteAttachmentsRequest(BaseModel):
+    attachmentIds: list[str] = Field(min_length=1)
+
+
+class DeleteAttachmentsResponse(BaseModel):
+    deletedIds: list[str]
+    deletedCount: int

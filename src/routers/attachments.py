@@ -26,7 +26,11 @@ try:
         TODO_ATTACHMENT_UPLOAD_STALE_SECONDS,
     )
     from ..connectors import get_db_connection
-    from ..models.attachments import DownloadAttachmentsRequest
+    from ..models.attachments import (
+        DeleteAttachmentsRequest,
+        DeleteAttachmentsResponse,
+        DownloadAttachmentsRequest,
+    )
     from ..services.attachment_storage import (
         AttachmentStorageDisabled,
         AttachmentStorageError,
@@ -45,7 +49,11 @@ except ImportError:  # pragma: no cover
         TODO_ATTACHMENT_UPLOAD_STALE_SECONDS,
     )
     from connectors import get_db_connection
-    from models.attachments import DownloadAttachmentsRequest
+    from models.attachments import (
+        DeleteAttachmentsRequest,
+        DeleteAttachmentsResponse,
+        DownloadAttachmentsRequest,
+    )
     from services.attachment_storage import (
         AttachmentStorageDisabled,
         AttachmentStorageError,
@@ -312,6 +320,81 @@ async def list_memo_attachments(
                 (memo_id,),
             )
             return [_serialize_attachment(row) for row in cursor.fetchall()]
+
+
+@router.post(
+    "/memos/{memo_id}/attachments/delete",
+    response_model=DeleteAttachmentsResponse,
+)
+async def delete_memo_attachments(
+    memo_id: str,
+    body: DeleteAttachmentsRequest,
+    user: dict = Depends(get_current_user),
+):
+    """업로더 본인의 ready attachment metadata를 원자적으로 tombstone 처리한다."""
+    if len(body.attachmentIds) > TODO_ATTACHMENT_MAX_COUNT_PER_MEMO:
+        raise HTTPException(status_code=422, detail="Too many attachments selected")
+    attachment_ids = [_validate_attachment_id(value) for value in body.attachmentIds]
+    if len(set(attachment_ids)) != len(attachment_ids):
+        raise HTTPException(status_code=422, detail="attachmentIds must be unique")
+
+    placeholders = ",".join(["%s"] * len(attachment_ids))
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            # First read: current locking memo/project/member authorization.
+            # write=False intentionally allows a downgraded viewer to delete
+            # their own upload, but service-owner bypass is rejected below.
+            memo = require_locked_memo_access(cursor, memo_id, user, write=False)
+            if memo.get("member_id") is None:
+                raise HTTPException(status_code=403, detail="Live membership required")
+            cursor.execute(
+                f"SELECT {ATTACHMENT_COLUMNS} FROM memo_attachments "
+                f"WHERE id IN ({placeholders}) ORDER BY id FOR UPDATE",
+                tuple(sorted(attachment_ids)),
+            )
+            rows = cursor.fetchall()
+            if len(rows) != len(attachment_ids):
+                raise HTTPException(status_code=404, detail="Attachment not found")
+            by_id = {row["id"]: row for row in rows}
+            for attachment_id in attachment_ids:
+                row = by_id[attachment_id]
+                if row["memo_id"] != memo_id:
+                    raise HTTPException(status_code=404, detail="Attachment not found")
+                if row["created_by"] != user["id"]:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Only the attachment uploader can delete it",
+                    )
+                _validate_attachment_row(row)
+                if row["deleted_at"] is None and row["status"] != "ready":
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Only ready attachments can be deleted",
+                    )
+
+            newly_deleted = [
+                attachment_id
+                for attachment_id in attachment_ids
+                if by_id[attachment_id]["deleted_at"] is None
+            ]
+            if newly_deleted:
+                delete_placeholders = ",".join(["%s"] * len(newly_deleted))
+                now_utc = utcnow_naive()
+                cursor.execute(
+                    "UPDATE memo_attachments "
+                    "SET deleted_at = %s, updated_at_utc = %s "
+                    f"WHERE id IN ({delete_placeholders}) "
+                    "AND deleted_at IS NULL AND status = 'ready'",
+                    (now_utc, now_utc, *sorted(newly_deleted)),
+                )
+                if cursor.rowcount != len(newly_deleted):
+                    raise HTTPException(
+                        status_code=409, detail="Attachment delete state changed"
+                    )
+    return {
+        "deletedIds": attachment_ids,
+        "deletedCount": len(newly_deleted),
+    }
 
 
 @router.post("/memos/{memo_id}/attachments")

@@ -9,6 +9,15 @@ responses never contain the bucket, object key, endpoint or credentials.
 이유만으로 허용하지 않는다. 기존 메모 write/private-backlog 권한도 계속 적용한다.
 첨부 목록·이미지 조회·다운로드는 기존 메모 read 권한을 유지한다.
 
+다운로드 선택 모달의 삭제는 `POST /api/memos/{memoId}/attachments/delete`로
+metadata만 soft-delete한다. 현재 memo read membership과 모든 선택 row의 정확한
+`created_by == current user`를 요구하므로 프로젝트 owner·서비스 owner·superadmin도
+타인이 업로드한 파일을 삭제할 수 없다. uploader가 viewer로 강등돼도 live membership이
+유지되면 본인 첨부는 삭제할 수 있다. 요청 ID를 전부 검증한 뒤 한 transaction에서
+tombstone하며, 하나라도 타인/타 메모/미존재/미완료 파일이면 전체 요청을 롤백한다.
+이미 삭제된 본인 row는 멱등 처리한다. R2 object는 이번 경로에서 읽거나 삭제하지 않으며,
+metadata tombstone만 기존 sync v4로 복제한다.
+
 ## Runtime configuration
 
 Attachment endpoints return HTTP 503 while
