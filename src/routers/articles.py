@@ -7,12 +7,17 @@ try:
     from ..auth_utils import get_current_user, require_admin
     from ..connectors import get_db_connection
     from ..models.base import PublishArticleRequest
-    from ..utils import can_manage_project, check_project_membership, generate_id, is_service_owner
+    from ..utils import (
+        can_manage_project,
+        generate_id,
+        is_service_owner,
+        require_memo_access,
+    )
 except ImportError:  # pragma: no cover
     from auth_utils import get_current_user, require_admin
     from connectors import get_db_connection
     from models.base import PublishArticleRequest
-    from utils import can_manage_project, check_project_membership, generate_id, is_service_owner
+    from utils import can_manage_project, generate_id, is_service_owner, require_memo_access
 
 
 router = APIRouter(prefix="/api", tags=["articles"])
@@ -271,24 +276,7 @@ async def get_memo_article(memo_id: str, user: dict = Depends(get_current_user))
     """특정 메모의 게시 상태 조회"""
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT m.id, m.project_id
-                FROM memos m JOIN projects p ON p.id = m.project_id
-                LEFT JOIN projects parent ON parent.id = p.parent_id
-                WHERE m.id = %s AND m.deleted_at IS NULL
-                  AND p.deleted_at IS NULL AND p.is_group = 0
-                  AND (p.parent_id IS NULL OR
-                       (parent.id IS NOT NULL AND parent.deleted_at IS NULL))
-                """,
-                (memo_id,),
-            )
-            memo = cursor.fetchone()
-            if not memo:
-                raise HTTPException(status_code=404, detail="Memo not found")
-
-            if not check_project_membership(cursor, memo["project_id"], user):
-                raise HTTPException(status_code=403, detail="Access denied")
+            require_memo_access(cursor, memo_id, user)
 
             cursor.execute(
                 """

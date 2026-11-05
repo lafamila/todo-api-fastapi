@@ -123,7 +123,73 @@ def _row_project_id(cursor, table: str, row: dict) -> str | None:
         cursor.execute("SELECT project_id FROM memos WHERE id = %s", (row.get("memo_id"),))
         parent = cursor.fetchone()
         return parent["project_id"] if parent else None
+    if table == "memo_attachments":
+        cursor.execute("SELECT project_id FROM memos WHERE id = %s", (row.get("memo_id"),))
+        parent = cursor.fetchone()
+        return parent["project_id"] if parent else None
     return None
+
+
+def _row_memo_scope(cursor, table: str, row: dict) -> dict | None:
+    """memo/version/attachment row의 authoritative memo privacy scope."""
+    if table == "memos":
+        return {
+            "id": row.get("id"),
+            "project_id": row.get("project_id"),
+            "kind": row.get("kind") or "memo",
+            "created_by": row.get("created_by"),
+        }
+    memo_id = row.get("memo_id") if table in {"memo_versions", "memo_attachments"} else None
+    if not memo_id:
+        return None
+    cursor.execute(
+        "SELECT id, project_id, kind, created_by FROM memos WHERE id = %s",
+        (memo_id,),
+    )
+    return cursor.fetchone()
+
+
+def sync_row_visible_to_account(
+    cursor, table: str, row: dict | None, account_id: str | None
+) -> bool:
+    """private backlog 계열 row가 exact creator 계정에 속하는지 판정한다.
+
+    일반 memo/project row에는 영향을 주지 않는다. object bytes는 이 계층에 없으며
+    attachment는 parent memo의 privacy를 상속한다.
+    """
+    if not account_id or not row:
+        return True
+    memo = _row_memo_scope(cursor, table, row)
+    if memo and (memo.get("kind") or "memo") == "backlog":
+        return memo.get("created_by") == account_id
+    return True
+
+
+def sync_row_pushable_by_account(
+    cursor, table: str, row: dict | None, account_id: str | None
+) -> bool:
+    """client credential이 wire로 보낼 수 있는 로컬 row인지 판정한다."""
+    if not sync_row_visible_to_account(cursor, table, row, account_id):
+        return False
+    if account_id and row and table == "memo_attachments":
+        if row.get("created_by") == account_id:
+            return True
+        cursor.execute(
+            """
+            SELECT m.kind, p.owner_id
+            FROM memos m
+            JOIN projects p ON p.id = m.project_id
+            WHERE m.id = %s
+            """,
+            (row.get("memo_id"),),
+        )
+        scope = cursor.fetchone()
+        return bool(
+            scope
+            and (scope.get("kind") or "memo") == "memo"
+            and scope.get("owner_id") == account_id
+        )
+    return True
 
 
 def serialize_row(table: str, row: dict, columns: tuple[str, ...] | None = None) -> dict:
@@ -140,7 +206,7 @@ def serialize_row(table: str, row: dict, columns: tuple[str, ...] | None = None)
                 if column in UTC_COLUMNS
                 else value.isoformat(timespec="milliseconds")
             )
-        elif column in {"is_secret", "is_group"}:
+        elif column in {"is_secret", "is_group", "is_image"}:
             payload[column] = bool(value)
         else:
             payload[column] = value
@@ -158,7 +224,7 @@ def deserialize_row(table: str, payload: dict, columns: tuple[str, ...]) -> dict
             row[column] = parse_iso_utc(value) if value else None
         elif column in WALL_CLOCK_COLUMNS:
             row[column] = _parse_naive(value)
-        elif column in {"is_secret", "is_group"}:
+        elif column in {"is_secret", "is_group", "is_image"}:
             row[column] = 1 if value else 0
         else:
             row[column] = value
@@ -227,6 +293,9 @@ def read_changes(
             # 삭제 전 scope를 change_log에 고정하지 않은 하드 삭제는 현재 계정 소속을
             # 증명할 수 없다. 업무 테이블은 tombstone을 쓰므로 이 예외 경로는 누출보다
             # 보수적으로 건너뛴다.
+            continue
+
+        if not sync_row_visible_to_account(cursor, table, row, account_id):
             continue
 
         project_id = _row_project_id(cursor, table, row)
@@ -313,6 +382,7 @@ def collect_local_changes(
     limit: int,
     columns_by_table: dict[str, tuple[str, ...]] | None = None,
     peer: str | None = None,
+    account_id: str | None = None,
 ) -> tuple[list[dict], int]:
     """push 용 — 계정 스코프 필터 없이 이 노드의 변경을 모은다 (단일 사용자 노드)."""
     cursor.execute(
@@ -344,6 +414,10 @@ def collect_local_changes(
             (row_id,),
         )
         row = cursor.fetchone()
+        if row is not None and not sync_row_pushable_by_account(
+            cursor, table, row, account_id
+        ):
+            continue
         change = {
             "seq": int(entry["seq"]),
             "table": table,

@@ -96,6 +96,17 @@ def merge_memos(cursor, loser_id: str, winner_id: str) -> dict:
         next_version += 1
         moved_versions += 1
 
+    # Attachment object_key는 origin_memo_id 기반으로 영구 고정된다. 현재 논리
+    # association만 winner로 옮겨 object copy 없이 접근을 보존한다.
+    cursor.execute(
+        """
+        UPDATE memo_attachments
+        SET memo_id = %s, updated_at_utc = %s
+        WHERE memo_id = %s
+        """,
+        (winner_id, now, loser_id),
+    )
+
     cursor.execute(
         "UPDATE memos SET deleted_at = %s, updated_at_utc = %s WHERE id = %s",
         (now, now, loser_id),
@@ -139,9 +150,31 @@ def merge_projects(cursor, loser_id: str, winner_id: str) -> dict:
     memo_ids = [row["id"] for row in cursor.fetchall()]
     for memo_id in memo_ids:
         cursor.execute(
-            "UPDATE memos SET project_id = %s, updated_at_utc = %s WHERE id = %s",
+            "UPDATE memos SET project_id = %s, updated_at = updated_at, updated_at_utc = %s WHERE id = %s",
             (winner_id, now, memo_id),
         )
+    # 같은 creator의 private backlog가 양쪽 project에 하나씩 있었다면 account별로
+    # 수렴한다. creator 경계를 넘겨 병합하지 않는다.
+    cursor.execute(
+        """
+        SELECT DISTINCT created_by
+        FROM memos
+        WHERE project_id = %s AND kind = 'backlog' AND deleted_at IS NULL
+          AND created_by IS NOT NULL
+        """,
+        (winner_id,),
+    )
+    backlog_creators = [row["created_by"] for row in cursor.fetchall()]
+    if backlog_creators:
+        try:
+            from .sync_apply import ApplyOutcome, _converge_backlogs
+        except ImportError:  # pragma: no cover
+            from services.sync_apply import ApplyOutcome, _converge_backlogs
+        convergence = ApplyOutcome()
+        for creator in backlog_creators:
+            _converge_backlogs(
+                cursor, winner_id, creator, convergence, record_issues=False
+            )
     # articles 는 동기화 대상이 아니지만 project_id 참조가 어긋나면 안 된다
     cursor.execute(
         "UPDATE articles SET project_id = %s WHERE project_id = %s",

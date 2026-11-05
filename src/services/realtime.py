@@ -17,7 +17,12 @@ try:
         serves_sync_peer_api,
     )
     from ..connectors import get_db_connection
-    from ..utils import can_write_project, check_project_membership
+    from ..utils import (
+        can_read_memo,
+        can_write_memo,
+        can_write_project,
+        check_project_membership,
+    )
     from .lock_registry import get_lock_registry
     from .sync_auth import (
         AccountResolutionError,
@@ -36,7 +41,7 @@ except ImportError:  # pragma: no cover
         serves_sync_peer_api,
     )
     from connectors import get_db_connection
-    from utils import can_write_project, check_project_membership
+    from utils import can_read_memo, can_write_memo, can_write_project, check_project_membership
     from services.lock_registry import get_lock_registry
     from services.sync_auth import (
         AccountResolutionError,
@@ -953,27 +958,8 @@ class MemoRealtimeServer:
         try:
             with get_db_connection() as conn:
                 with conn.cursor() as cursor:
-                    cursor.execute(
-                        """
-                        SELECT m.project_id
-                        FROM memos m
-                        JOIN projects p ON p.id = m.project_id
-                        LEFT JOIN projects parent ON parent.id = p.parent_id
-                        WHERE m.id = %s AND m.deleted_at IS NULL
-                          AND p.deleted_at IS NULL AND p.is_group = 0
-                          AND (p.parent_id IS NULL OR
-                               (parent.id IS NOT NULL AND parent.deleted_at IS NULL))
-                        """,
-                        (memo_id,),
-                    )
-                    memo = cursor.fetchone()
-                    if not memo:
-                        return False
-                    if require_write:
-                        return can_write_project(cursor, memo["project_id"], user)
-                    return check_project_membership(
-                        cursor, memo["project_id"], user
-                    )
+                    checker = can_write_memo if require_write else can_read_memo
+                    return checker(cursor, memo_id, user)
         except Exception:  # noqa: BLE001 - 소켓 권한 판정은 fail-closed
             logger.exception("memo socket authorization failed")
             return False

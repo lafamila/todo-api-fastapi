@@ -90,10 +90,10 @@ class PushSchemaGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.status_code, 409)
         self.assertEqual(
             caught.exception.detail["code"],
-            "sync_hierarchy_schema_upgrade_required",
+            "sync_private_media_schema_upgrade_required",
         )
 
-    def test_explicit_v2_drift_is_rejected_because_structural_fields_are_security_critical(self) -> None:
+    def test_explicit_v3_drift_is_rejected_because_private_fields_are_security_critical(self) -> None:
         tables = declared_tables()
         tables["memos"] = [
             column for column in tables["memos"] if column != "status"
@@ -102,7 +102,7 @@ class PushSchemaGuardTests(unittest.IsolatedAsyncioTestCase):
             _resolve_push_columns(
                 SyncPushRequest(
                     clientId=CLIENT_ID,
-                    schemaVersion=2,
+                    schemaVersion=3,
                     allowSchemaDrift=True,
                     tables=tables,
                     changes=[SyncChangeInput(table="memos", rowId="m1")],
@@ -111,7 +111,7 @@ class PushSchemaGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.status_code, 409)
         self.assertEqual(
             caught.exception.detail["code"],
-            "sync_hierarchy_schema_upgrade_required",
+            "sync_private_media_schema_upgrade_required",
         )
 
     def test_change_model_preserves_base_clock_metadata(self) -> None:
@@ -343,12 +343,15 @@ class SyncSecurityDatabaseTests(unittest.TestCase):
                     INSERT INTO project_members
                         (id, project_id, user_id, role, invited_at, updated_at_utc)
                     VALUES
+                        ('pm-owner', 'p-owned', 'account-a', 'owner', %s, %s),
                         ('pm-editor', 'p-shared', 'account-a', 'editor', %s, %s),
                         ('pm-viewer', 'p-viewer', 'account-a', 'viewer', %s, %s),
                         ('pm-deleted', 'p-other', 'account-a', 'editor', %s, %s),
                         ('pm-collab', 'p-owned', 'collaborator-x', 'editor', %s, %s)
                     """,
                     (
+                        MOMENT,
+                        MOMENT,
                         MOMENT,
                         MOMENT,
                         MOMENT,

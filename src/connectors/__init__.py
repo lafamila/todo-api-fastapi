@@ -7,6 +7,14 @@ try:
 except ImportError:  # pragma: no cover
     from sync_schema import SYNC_TABLE_ORDER, declared_tables
 
+try:
+    from ..services.attachment_schema import ensure_attachment_schema
+except ImportError:  # pragma: no cover - attachment lane may be absent during rolling checkout
+    try:
+        from services.attachment_schema import ensure_attachment_schema
+    except ImportError:  # pragma: no cover
+        ensure_attachment_schema = None
+
 # 접속값은 `config.py` 가 확정한다 — `TODO_MODE` 프리셋(dev→teddynote_dev,
 # local→teddynote, prod→teddy-mysql)이 여기까지 닿아야 하기 때문이다.
 # `TODO_MODE` 미설정이면 예전과 동일한 `os.getenv` 결과가 그대로 들어온다.
@@ -339,6 +347,10 @@ def init_db():
 
             # ============ 동기화 스키마 (root plan: TODO OFFLINE SYNC) ============
 
+            # attachment metadata table must exist before sync v4 creates its triggers.
+            if ensure_attachment_schema is not None:
+                ensure_attachment_schema(cursor)
+
             _init_sync_schema(cursor)
 
             # 세션 DB 영속화는 local 모드 전용 opt-in — 기본값(dev/prod)에서는 테이블도 만들지 않는다.
@@ -412,6 +424,19 @@ def _init_sync_schema(cursor) -> None:
     """동기화용 컬럼·테이블·트리거를 멱등하게 반영한다."""
     for statement in _SYNC_ADDITIVE_DDL:
         _try_ddl(cursor, statement)
+
+    # Legacy shared backlog becomes the recorded creator's private backlog.
+    # Missing creator is deterministically assigned to the project owner without
+    # touching content/history/display edit time.
+    cursor.execute(
+        """
+        UPDATE memos m
+        JOIN projects p ON p.id = m.project_id
+        SET m.created_by = p.owner_id, m.updated_at = m.updated_at
+        WHERE m.kind = 'backlog'
+          AND (m.created_by IS NULL OR m.created_by = '')
+        """
+    )
 
     # naive → UTC 백필. 이미 값이 있는 행은 건드리지 않는다 (재실행 안전).
     for table, source_column in _UTC_BACKFILL_SOURCE.items():

@@ -16,6 +16,7 @@ try:
     from .connectors import get_db_connection, init_db
     from .routers.auth import router as auth_router
     from .routers.articles import router as articles_router
+    from .routers.attachments import router as attachments_router
     from .routers.daily_tasks import router as daily_tasks_router
     from .routers.memos import router as memos_router
     from .routers.projects import router as projects_router
@@ -36,6 +37,7 @@ except ImportError:  # pragma: no cover
     from connectors import get_db_connection, init_db
     from routers.auth import router as auth_router
     from routers.articles import router as articles_router
+    from routers.attachments import router as attachments_router
     from routers.daily_tasks import router as daily_tasks_router
     from routers.memos import router as memos_router
     from routers.projects import router as projects_router
@@ -108,6 +110,7 @@ fastapi_app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
 
@@ -165,6 +168,7 @@ fastapi_app.include_router(auth_router)
 fastapi_app.include_router(projects_router)
 fastapi_app.include_router(memos_router)
 fastapi_app.include_router(articles_router)
+fastapi_app.include_router(attachments_router)
 fastapi_app.include_router(daily_tasks_router)
 fastapi_app.include_router(sync_router)
 

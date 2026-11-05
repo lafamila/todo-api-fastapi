@@ -56,7 +56,7 @@ class SchemaHandshakeTests(unittest.TestCase):
         self.assertEqual(caught.exception.kind, "schema")
         self.assertIn("로컬 스키마가 앞서", caught.exception.message)
 
-    def test_v2_hierarchy_drift_is_fail_closed_even_when_enabled(self) -> None:
+    def test_v3_private_media_drift_is_fail_closed_even_when_enabled(self) -> None:
         peer_tables = declared_tables()
         peer_tables["memos"] = [
             column for column in peer_tables["memos"] if column != "status"
@@ -66,7 +66,7 @@ class SchemaHandshakeTests(unittest.TestCase):
         try:
             with self.assertRaises(SyncBlocked) as caught:
                 self.daemon._check_schema(
-                    _handshake(schemaVersion=2, tables=peer_tables)
+                    _handshake(schemaVersion=3, tables=peer_tables)
                 )
         finally:
             sync_daemon_module.SYNC_ALLOW_SCHEMA_DRIFT = original

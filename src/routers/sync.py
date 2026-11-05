@@ -50,6 +50,7 @@ try:
         intersect_columns,
     )
     from ..timeutil import iso_utc, utcnow_naive
+    from ..utils import require_memo_access
     from ..services.lock_registry import get_lock_registry
     from ..services.merge import MergeError, merge_memos, merge_projects
     from ..services.realtime import get_realtime_server
@@ -101,6 +102,7 @@ except ImportError:  # pragma: no cover
         intersect_columns,
     )
     from timeutil import iso_utc, utcnow_naive
+    from utils import require_memo_access
     from services.lock_registry import get_lock_registry
     from services.merge import MergeError, merge_memos, merge_projects
     from services.realtime import get_realtime_server
@@ -253,13 +255,13 @@ def _resolve_push_columns(body: SyncPushRequest) -> dict[str, tuple[str, ...]]:
     """push 스키마를 적용 **전에** 검증하고 명시적 drift 협상만 허용한다."""
     if body.schemaVersion == SCHEMA_VERSION:
         return {}
-    # v3의 parent_id/is_group/kind는 권한 경계다. v2 교집합 적용은 child를 root로,
-    # backlog를 일반 memo로 바꾸므로 allowSchemaDrift로도 허용하지 않는다.
-    if body.schemaVersion < 3:
+    # v4의 private backlog ownership/attachment metadata는 권한 경계다. 구버전
+    # 교집합 적용은 다른 계정의 backlog를 공유 memo처럼 노출하므로 허용하지 않는다.
+    if body.schemaVersion < 4:
         raise HTTPException(
             status_code=409,
             detail={
-                "code": "sync_hierarchy_schema_upgrade_required",
+                "code": "sync_private_media_schema_upgrade_required",
                 "serverSchemaVersion": SCHEMA_VERSION,
                 "clientSchemaVersion": body.schemaVersion,
             },
@@ -339,6 +341,16 @@ def _existing_project_id(cursor, table: str, row_id: str) -> str | None:
             """,
             (row_id,),
         )
+    elif table == "memo_attachments":
+        cursor.execute(
+            """
+            SELECT m.project_id
+            FROM memo_attachments ma
+            JOIN memos m ON m.id = ma.memo_id
+            WHERE ma.id = %s
+            """,
+            (row_id,),
+        )
     else:
         return None
     row = cursor.fetchone()
@@ -358,6 +370,21 @@ def _memo_project_id(
     cursor.execute("SELECT project_id FROM memos WHERE id = %s", (memo_id,))
     memo = cursor.fetchone()
     return memo.get("project_id") if memo else None
+
+
+def _memo_for_sync_authorization(
+    cursor, memo_id: str | None, incoming_memos: dict[str, dict]
+) -> dict | None:
+    if not memo_id:
+        return None
+    incoming = incoming_memos.get(str(memo_id))
+    if incoming:
+        return incoming
+    cursor.execute(
+        "SELECT id, project_id, kind, created_by, deleted_at FROM memos WHERE id = %s",
+        (memo_id,),
+    )
+    return cursor.fetchone()
 
 
 def _forbidden_change(
@@ -504,6 +531,13 @@ def _authorize_sync_changes(
         for change, row in normalized
         if change.get("table") == "memos" and row
     }
+    incoming_member_roles = {
+        (str(row.get("project_id")), str(row.get("user_id"))): row.get("role")
+        for change, row in normalized
+        if change.get("table") == "project_members"
+        and row
+        and row.get("deleted_at") is None
+    }
     # 새 group+child+memo가 한 batch에 들어온 경우 DB에는 아직 group이 없다.
     # apply와 같은 canonical first child를 골라 그 child 권한으로 검사한다.
     for change, row in normalized:
@@ -539,6 +573,28 @@ def _authorize_sync_changes(
             role = _project_role(cursor, project_id, account_id)
         role_cache[project_id] = role
         return role
+
+    def explicit_role_for(project_id: str | None) -> str | None:
+        if not project_id:
+            return None
+        cursor.execute(
+            """
+            SELECT pm.role
+            FROM project_members pm
+            JOIN projects p ON p.id = pm.project_id AND p.deleted_at IS NULL
+            LEFT JOIN projects parent ON parent.id = p.parent_id
+            WHERE pm.project_id = %s AND pm.user_id = %s
+              AND pm.deleted_at IS NULL
+              AND (p.parent_id IS NULL OR
+                   (parent.id IS NOT NULL AND parent.deleted_at IS NULL))
+            LIMIT 1
+            """,
+            (project_id, account_id),
+        )
+        member = cursor.fetchone()
+        if member:
+            return member.get("role")
+        return incoming_member_roles.get((str(project_id), account_id))
 
     for change, row in normalized:
         table = str(change["table"])
@@ -606,10 +662,22 @@ def _authorize_sync_changes(
 
         if table == "memos":
             incoming_project = row.get("project_id") or existing_project
+            cursor.execute(
+                "SELECT project_id, kind, created_by FROM memos WHERE id = %s",
+                (row_id,),
+            )
+            existing_memo = cursor.fetchone()
+            memo_kind = row.get("kind") or (existing_memo or {}).get("kind") or "memo"
+            memo_creator = row.get("created_by") or (existing_memo or {}).get("created_by")
+            if memo_kind == "backlog" and (
+                memo_creator != account_id
+                or (existing_memo is not None and existing_memo.get("created_by") != account_id)
+            ):
+                raise _forbidden_change(
+                    table, row_id, "private_backlog_owner_mismatch"
+                )
             if existing_project and incoming_project and existing_project != incoming_project:
-                cursor.execute("SELECT kind FROM memos WHERE id = %s", (row_id,))
-                existing_memo = cursor.fetchone()
-                move_kind = row.get("kind") or (existing_memo or {}).get("kind") or "memo"
+                move_kind = memo_kind
                 if move_kind != "memo" and not _is_backlog_group_migration(
                     cursor,
                     str(existing_project),
@@ -640,24 +708,122 @@ def _authorize_sync_changes(
                     row.get("deleted_at") is not None
                     or (change.get("op") == "delete" and change.get("row") is None)
                 )
+                and memo_kind != "backlog"
                 and role_for(str(existing_project)) != "owner"
             ):
                 raise _forbidden_change(table, row_id, "memo_delete_requires_owner")
             for project_id in {existing_project, incoming_project} - {None}:
-                if role_for(str(project_id)) not in {"owner", "editor"}:
+                allowed_role = (
+                    explicit_role_for(str(project_id))
+                    if memo_kind == "backlog"
+                    else role_for(str(project_id))
+                )
+                allowed_roles = (
+                    {"owner", "editor", "viewer"}
+                    if memo_kind == "backlog"
+                    else {"owner", "editor"}
+                )
+                if allowed_role not in allowed_roles:
                     raise _forbidden_change(table, row_id)
             if not incoming_project:
                 raise _forbidden_change(table, row_id)
             continue
 
         if table == "memo_versions":
-            incoming_project = _memo_project_id(
-                cursor, row.get("memo_id"), incoming_memos
+            cursor.execute(
+                "SELECT memo_id FROM memo_versions WHERE id = %s",
+                (row_id,),
             )
+            existing_version = cursor.fetchone()
+            memo_id = row.get("memo_id") or (existing_version or {}).get("memo_id")
+            if (
+                existing_version is not None
+                and row.get("memo_id") is not None
+                and row.get("memo_id") != existing_version.get("memo_id")
+            ):
+                raise _forbidden_change(
+                    table, row_id, "memo_version_parent_is_immutable"
+                )
+            memo = _memo_for_sync_authorization(
+                cursor, memo_id, incoming_memos
+            )
+            incoming_project = memo.get("project_id") if memo else None
             for project_id in {existing_project, incoming_project} - {None}:
-                if role_for(str(project_id)) not in {"owner", "editor"}:
+                if memo and (memo.get("kind") or "memo") == "backlog":
+                    if memo.get("created_by") != account_id or explicit_role_for(
+                        str(project_id)
+                    ) not in {"owner", "editor", "viewer"}:
+                        raise _forbidden_change(
+                            table, row_id, "private_backlog_owner_mismatch"
+                        )
+                elif role_for(str(project_id)) not in {"owner", "editor"}:
                     raise _forbidden_change(table, row_id)
             if not (incoming_project or existing_project):
+                raise _forbidden_change(table, row_id)
+            continue
+
+        if table == "memo_attachments":
+            cursor.execute(
+                "SELECT memo_id, created_by FROM memo_attachments WHERE id = %s",
+                (row_id,),
+            )
+            existing_attachment = cursor.fetchone()
+            memo_id = row.get("memo_id") or (existing_attachment or {}).get("memo_id")
+            attachment_creator = row.get("created_by") or (
+                existing_attachment or {}
+            ).get("created_by")
+            memo = _memo_for_sync_authorization(cursor, memo_id, incoming_memos)
+            if not memo:
+                raise _forbidden_change(table, row_id, "attachment_memo_missing")
+            project_id = memo.get("project_id")
+            is_reparent = bool(
+                existing_attachment is not None
+                and existing_attachment.get("memo_id") != memo_id
+            )
+            reparent_allowed = False
+            if is_reparent:
+                source = _memo_for_sync_authorization(
+                    cursor, existing_attachment.get("memo_id"), incoming_memos
+                )
+                cursor.execute(
+                    "SELECT owner_id FROM projects WHERE id = %s AND deleted_at IS NULL",
+                    (project_id,),
+                )
+                project = cursor.fetchone()
+                regular_owner_merge = bool(
+                    source
+                    and (source.get("kind") or "memo") == "memo"
+                    and (memo.get("kind") or "memo") == "memo"
+                    and source.get("project_id") == project_id
+                    and project
+                    and project.get("owner_id") == account_id
+                )
+                private_owner_convergence = bool(
+                    source
+                    and source.get("kind") == "backlog"
+                    and memo.get("kind") == "backlog"
+                    and source.get("project_id") == project_id
+                    and source.get("created_by") == account_id
+                    and memo.get("created_by") == account_id
+                    and attachment_creator == account_id
+                )
+                reparent_allowed = regular_owner_merge or private_owner_convergence
+            if is_reparent and not reparent_allowed:
+                raise _forbidden_change(
+                    table, row_id, "attachment_reparent_forbidden"
+                )
+            if not is_reparent and attachment_creator != account_id:
+                raise _forbidden_change(
+                    table, row_id, "attachment_creator_mismatch"
+                )
+            if (memo.get("kind") or "memo") == "backlog":
+                if memo.get("created_by") != account_id or explicit_role_for(
+                    str(project_id)
+                ) not in {"owner", "editor", "viewer"}:
+                    raise _forbidden_change(
+                        table, row_id, "private_backlog_owner_mismatch"
+                    )
+            elif role_for(str(project_id)) not in {"owner", "editor"}:
                 raise _forbidden_change(table, row_id)
             continue
 
@@ -671,23 +837,12 @@ def _authorize_sync_changes(
 
 
 def _require_memo_write_access(cursor, memo_id: str, account_id: str) -> None:
-    cursor.execute(
-        """
-        SELECT m.project_id
-        FROM memos m
-        JOIN projects p ON p.id = m.project_id
-        LEFT JOIN projects parent ON parent.id = p.parent_id
-        WHERE m.id = %s AND m.deleted_at IS NULL
-          AND p.deleted_at IS NULL AND p.is_group = 0
-          AND (p.parent_id IS NULL OR (parent.id IS NOT NULL AND parent.deleted_at IS NULL))
-        """,
-        (memo_id,),
+    require_memo_access(
+        cursor,
+        memo_id,
+        {"id": account_id, "permission": "user"},
+        write=True,
     )
-    memo = cursor.fetchone()
-    if memo is None:
-        raise HTTPException(status_code=404, detail="Memo not found")
-    if _project_role(cursor, memo["project_id"], account_id) not in {"owner", "editor"}:
-        raise HTTPException(status_code=403, detail="Access denied")
 
 
 def _handshake_identity(cursor, account_id: str) -> dict:
@@ -1037,7 +1192,7 @@ def _issue_project_ids(cursor, issue: dict) -> set[str]:
             f"SELECT DISTINCT project_id FROM `{table}` WHERE id IN ({placeholders})",
             params,
         )
-    else:
+    elif table == "memo_versions":
         cursor.execute(
             f"""
             SELECT DISTINCT m.project_id
@@ -1047,12 +1202,59 @@ def _issue_project_ids(cursor, issue: dict) -> set[str]:
             """,
             params,
         )
+    else:
+        cursor.execute(
+            f"""
+            SELECT DISTINCT m.project_id
+            FROM memo_attachments ma
+            JOIN memos m ON m.id = ma.memo_id
+            WHERE ma.id IN ({placeholders})
+            """,
+            params,
+        )
     return {row["project_id"] for row in cursor.fetchall()}
+
+
+def _issue_memo_ids(cursor, issue: dict) -> set[str]:
+    table = issue.get("refTable") or issue.get("ref_table")
+    refs = {
+        str(ref)
+        for ref in (
+            issue.get("refId") or issue.get("ref_id"),
+            issue.get("peerRefId") or issue.get("peer_ref_id"),
+        )
+        if ref
+    }
+    if not refs:
+        return set()
+    placeholders = ", ".join(["%s"] * len(refs))
+    params = tuple(refs)
+    if table == "memos":
+        return refs
+    if table == "memo_versions":
+        cursor.execute(
+            f"SELECT DISTINCT memo_id FROM memo_versions WHERE id IN ({placeholders})",
+            params,
+        )
+    elif table == "memo_attachments":
+        cursor.execute(
+            f"SELECT DISTINCT memo_id FROM memo_attachments WHERE id IN ({placeholders})",
+            params,
+        )
+    else:
+        return set()
+    return {row["memo_id"] for row in cursor.fetchall()}
 
 
 def _issue_visible_to_user(
     cursor, issue: dict, user: dict, visible: set[str] | None = None
 ) -> bool:
+    memo_ids = _issue_memo_ids(cursor, issue)
+    for memo_id in memo_ids:
+        try:
+            require_memo_access(cursor, memo_id, user)
+        except HTTPException:
+            return False
     project_ids = _issue_project_ids(cursor, issue)
     if not project_ids:
         # schema/identity/clock 같은 노드 전역 이슈는 서비스 owner만 본다.

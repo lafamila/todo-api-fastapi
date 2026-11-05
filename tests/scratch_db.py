@@ -81,6 +81,7 @@ def use_scratch_database(name: str | None = None) -> str:
 
 TRUNCATE_ORDER = (
     "articles",
+    "memo_attachments",
     "memo_versions",
     "memos",
     "project_members",

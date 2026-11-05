@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import logging
+import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -27,6 +29,7 @@ try:
     )
     from ..timeutil import kst_label, utcnow_naive
     from ..utils import generate_id
+    from .attachment_storage import canonical_object_key
     from .sync_store import (
         deserialize_row,
         get_sync_receipt,
@@ -45,6 +48,7 @@ except ImportError:  # pragma: no cover
     )
     from timeutil import kst_label, utcnow_naive
     from utils import generate_id
+    from services.attachment_storage import canonical_object_key
     from services.sync_store import (
         deserialize_row,
         get_sync_receipt,
@@ -55,6 +59,9 @@ except ImportError:  # pragma: no cover
 
 
 logger = logging.getLogger(__name__)
+
+_SAFE_IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+_MIME_RE = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$")
 
 SIDE_CLIENT = "client"
 SIDE_SERVER = "server"
@@ -371,7 +378,13 @@ def _apply_one(
         if table == "projects" and bool(incoming.get("is_group")):
             _migrate_group_memos(cursor, row_id)
         if table == "memos" and incoming.get("kind") == "backlog":
-            _converge_backlogs(cursor, incoming["project_id"], outcome, record_issues)
+            _converge_backlogs(
+                cursor,
+                incoming["project_id"],
+                incoming.get("created_by"),
+                outcome,
+                record_issues,
+            )
         return
 
     existing_clock = existing.get("updated_at_utc")
@@ -439,7 +452,13 @@ def _apply_one(
     if table == "projects" and bool(incoming.get("is_group")):
         _migrate_group_memos(cursor, row_id)
     if table == "memos" and incoming.get("kind") == "backlog":
-        _converge_backlogs(cursor, incoming["project_id"], outcome, record_issues)
+        _converge_backlogs(
+            cursor,
+            incoming["project_id"],
+            incoming.get("created_by"),
+            outcome,
+            record_issues,
+        )
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -632,6 +651,12 @@ def normalize_hierarchy_row(
         normalized["kind"] = kind
         if existing is not None and kind != (existing.get("kind") or "memo"):
             return normalized, None, "memo_kind_is_immutable"
+        created_by = normalized.get("created_by", (existing or {}).get("created_by"))
+        if not created_by:
+            return normalized, None, "memo_creator_missing"
+        normalized["created_by"] = created_by
+        if existing is not None and created_by != existing.get("created_by"):
+            return normalized, None, "memo_creator_is_immutable"
 
         target_id = normalized.get("project_id") or (existing or {}).get("project_id")
         target = _project_shape(cursor, str(target_id) if target_id else None)
@@ -691,20 +716,154 @@ def normalize_hierarchy_row(
             or project.get("parent_deleted_at") is not None
         ) and normalized.get("deleted_at") is None:
             return normalized, None, "membership_target_project_is_deleted"
+
+    if table == "memo_versions" and existing is not None:
+        normalized.setdefault("memo_id", existing.get("memo_id"))
+        if normalized.get("memo_id") != existing.get("memo_id"):
+            return normalized, None, "memo_version_parent_is_immutable"
+
+    if table == "memo_attachments":
+        if existing is not None:
+            for column in (
+                "memo_id", "origin_memo_id", "created_by", "file_name", "content_type", "byte_size",
+                "is_image", "sha256", "object_key", "status", "created_at",
+            ):
+                normalized.setdefault(column, existing.get(column))
+        memo_id = normalized.get("memo_id") or (existing or {}).get("memo_id")
+        origin_memo_id = normalized.get("origin_memo_id") or (
+            existing or {}
+        ).get("origin_memo_id")
+        created_by = normalized.get("created_by") or (existing or {}).get("created_by")
+        if not memo_id or not origin_memo_id or not created_by:
+            return normalized, None, "attachment_owner_or_memo_missing"
+        try:
+            expected_key = canonical_object_key(str(origin_memo_id), row_id)
+        except ValueError:
+            return normalized, None, "invalid_attachment_identity"
+        if normalized.get("object_key") != expected_key:
+            return normalized, None, "attachment_object_key_not_canonical"
+        status = normalized.get("status") or (existing or {}).get("status")
+        if status not in {"uploading", "ready", "failed"}:
+            return normalized, None, "invalid_attachment_status"
+        sha256 = str(normalized.get("sha256") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            return normalized, None, "invalid_attachment_sha256"
+        try:
+            byte_size = int(normalized.get("byte_size"))
+        except (TypeError, ValueError):
+            return normalized, None, "invalid_attachment_byte_size"
+        if byte_size < 0:
+            return normalized, None, "invalid_attachment_byte_size"
+        file_name = str(normalized.get("file_name") or "")
+        normalized_name = unicodedata.normalize("NFC", file_name).replace("\\", "/")
+        safe_name = normalized_name.rsplit("/", 1)[-1]
+        safe_name = "".join(
+            char
+            for char in safe_name
+            if unicodedata.category(char) not in {"Cc", "Cf"}
+        ).strip().strip(".")
+        if (
+            not safe_name
+            or safe_name != file_name
+            or len(safe_name.encode("utf-8")) > 255
+        ):
+            return normalized, None, "invalid_attachment_file_name"
+        content_type = str(normalized.get("content_type") or "")
+        if not _MIME_RE.fullmatch(content_type):
+            return normalized, None, "invalid_attachment_content_type"
+        if bool(normalized.get("is_image")) != (content_type in _SAFE_IMAGE_TYPES):
+            return normalized, None, "invalid_attachment_image_metadata"
+        if existing is not None:
+            immutable = (
+                "origin_memo_id", "created_by", "file_name", "content_type", "byte_size",
+                "is_image", "sha256", "object_key", "created_at",
+            )
+            for column in immutable:
+                incoming_value = normalized.get(column)
+                existing_value = existing.get(column)
+                if (
+                    column == "created_at"
+                    and isinstance(incoming_value, str)
+                    and isinstance(existing_value, datetime)
+                ):
+                    incoming_value = datetime.fromisoformat(
+                        incoming_value.rstrip("Zz")
+                    ).replace(tzinfo=None)
+                if column in normalized and incoming_value != existing_value:
+                    return normalized, None, f"attachment_{column}_is_immutable"
+            if normalized.get("memo_id") != existing.get("memo_id") and not _same_attachment_reparent_scope(
+                cursor,
+                str(existing.get("memo_id")),
+                str(normalized.get("memo_id")),
+                str(created_by),
+            ):
+                return normalized, None, "attachment_parent_is_immutable"
+            old_status = existing.get("status")
+            allowed = {
+                "uploading": {"uploading", "ready", "failed"},
+                "failed": {"failed", "uploading", "ready"},
+                "ready": {"ready"},
+            }
+            if status not in allowed.get(old_status, set()):
+                return normalized, None, "invalid_attachment_status_transition"
+        elif str(origin_memo_id) != str(memo_id) and not _same_attachment_reparent_scope(
+            cursor, str(origin_memo_id), str(memo_id), str(created_by)
+        ):
+            return normalized, None, "attachment_origin_scope_mismatch"
     return normalized, None, None
 
 
+def _same_attachment_reparent_scope(
+    cursor, source_memo_id: str, target_memo_id: str, created_by: str
+) -> bool:
+    cursor.execute(
+        """
+        SELECT id, project_id, kind, created_by
+        FROM memos
+        WHERE id IN (%s, %s)
+        """,
+        (source_memo_id, target_memo_id),
+    )
+    rows = {row["id"]: row for row in cursor.fetchall()}
+    source = rows.get(source_memo_id)
+    target = rows.get(target_memo_id)
+    same_shared_project = bool(
+        source
+        and target
+        and (source.get("kind") or "memo") == "memo"
+        and (target.get("kind") or "memo") == "memo"
+        and source.get("project_id") == target.get("project_id")
+    )
+    same_private_owner = bool(
+        source
+        and target
+        and source.get("kind") == "backlog"
+        and target.get("kind") == "backlog"
+        and source.get("created_by") == created_by
+        and target.get("created_by") == created_by
+        and source.get("project_id") == target.get("project_id")
+    )
+    return same_shared_project or same_private_owner
+
+
 def _converge_backlogs(
-    cursor, project_id: str, outcome: ApplyOutcome, record_issues: bool
+    cursor,
+    project_id: str,
+    created_by: str | None,
+    outcome: ApplyOutcome,
+    record_issues: bool,
 ) -> None:
-    """서로 다른 backlog ID를 한 identity로 수렴하고 모든 내용을 보존한다."""
+    """같은 account의 서로 다른 backlog ID를 한 identity로 수렴한다."""
+    if not created_by:
+        return
     cursor.execute(
         """
         SELECT * FROM memos
-        WHERE project_id = %s AND kind = 'backlog' AND deleted_at IS NULL
+        WHERE project_id = %s AND kind = 'backlog' AND created_by = %s
+          AND deleted_at IS NULL
         ORDER BY id ASC
         """,
-        (project_id,),
+        (project_id, created_by),
     )
     rows = cursor.fetchall()
     if len(rows) <= 1:
@@ -762,6 +921,16 @@ def _converge_backlogs(
                     (winner["id"], next_version, now, version["id"]),
                 )
                 next_version += 1
+            # Object bytes/key stay immutable. origin_memo_id records the key owner,
+            # while memo_id is the current logical association after convergence.
+            cursor.execute(
+                """
+                UPDATE memo_attachments
+                SET memo_id = %s, updated_at_utc = %s
+                WHERE memo_id = %s
+                """,
+                (winner["id"], now, loser["id"]),
+            )
             cursor.execute(
                 "UPDATE memos SET deleted_at = %s, updated_at_utc = %s WHERE id = %s",
                 (now, now, loser["id"]),
@@ -788,6 +957,7 @@ def _converge_backlogs(
         "kind": "duplicate_memo",
         "table": "memos",
         "refId": winner["id"],
+        "createdBy": created_by,
         "peerRefIds": [row["id"] for row in rows[1:]],
         "resolution": "backlog_converged",
     }

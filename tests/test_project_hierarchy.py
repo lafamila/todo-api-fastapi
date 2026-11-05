@@ -84,7 +84,7 @@ class ProjectHierarchyIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 cursor.execute(
                     "UPDATE memos SET content = 'body', updated_at = %s, updated_at_utc = %s "
                     "WHERE id = %s",
-                    (old_updated, old_updated, backlog_id(root["id"])),
+                    (old_updated, old_updated, backlog_id(root["id"], OWNER["id"])),
                 )
                 cursor.execute(
                     """INSERT INTO memo_versions
@@ -129,7 +129,7 @@ class ProjectHierarchyIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(roles, {OWNER["id"]: "owner", MEMBER["id"]: "editor"})
 
         backlog = await memos.get_project_backlog(child["id"], OWNER)
-        self.assertEqual(backlog["id"], backlog_id(root["id"]))
+        self.assertEqual(backlog["id"], backlog_id(root["id"], OWNER["id"]))
         with self.assertRaises(HTTPException) as group_backlog:
             await memos.get_project_backlog(root["id"], OWNER)
         self.assertEqual(group_backlog.exception.status_code, 409)
@@ -200,7 +200,7 @@ class ProjectHierarchyIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 moment = datetime(2026, 1, 1)
                 cursor.execute(
                     "UPDATE memos SET deleted_at = %s, updated_at_utc = %s WHERE id = %s",
-                    (moment, moment, backlog_id(root["id"])),
+                    (moment, moment, backlog_id(root["id"], OWNER["id"])),
                 )
 
         async def create_in_thread():
@@ -295,7 +295,7 @@ class ProjectHierarchyIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 )
         with self.assertRaises(HTTPException) as direct_hidden:
             await memos.get_memo("stale-group-memo", OWNER)
-        self.assertEqual(direct_hidden.exception.status_code, 409)
+        self.assertEqual(direct_hidden.exception.status_code, 404)
 
     async def test_child_only_member_sees_parent_for_navigation_without_parent_access(self) -> None:
         root = await _create_root()

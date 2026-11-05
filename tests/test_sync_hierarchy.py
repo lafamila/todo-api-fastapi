@@ -311,6 +311,7 @@ class HierarchySyncTests(unittest.TestCase):
 
     def test_first_child_batch_moves_backlog_with_group_transition(self) -> None:
         self.insert_project("root")
+        self.insert_member("pm-root", "root", ACCOUNT, "owner")
         self.insert_memo("backlog", "root", kind="backlog", content="preserved")
         clock = BASE + timedelta(seconds=1)
         batch = [
@@ -320,6 +321,23 @@ class HierarchySyncTests(unittest.TestCase):
                 "memos", "backlog",
                 memo_row("backlog", "child", kind="backlog", content="preserved", clock=clock),
                 3,
+            ),
+            change(
+                "project_members",
+                "pm-child",
+                {
+                    "id": "pm-child",
+                    "project_id": "child",
+                    "user_id": ACCOUNT,
+                    "username": None,
+                    "display_name": None,
+                    "email": None,
+                    "role": "owner",
+                    "invited_at": BASE.isoformat(timespec="milliseconds"),
+                    "updated_at_utc": iso_utc(clock),
+                    "deleted_at": None,
+                },
+                4,
             ),
         ]
         with get_db_connection(sync_applying=True) as conn:
@@ -451,6 +469,7 @@ class HierarchySyncTests(unittest.TestCase):
     def test_delegated_lock_requires_live_leaf_memo_and_live_ancestor(self) -> None:
         self.insert_project("root", is_group=True)
         self.insert_project("leaf", parent_id="root")
+        self.insert_member("pm-leaf", "leaf", ACCOUNT, "owner")
         self.insert_memo("live", "leaf")
         self.insert_memo("group-memo", "root")
         self.insert_memo("deleted", "leaf", deleted_at=BASE)
@@ -506,8 +525,8 @@ class _RealtimeProbe:
     async def emit_memo_pulled(self, memo_id, *_args):
         self.calls.append(("emit", memo_id))
 
-    async def emit_sync_applied(self, _payload):
-        self.calls.append(("sync",))
+    async def emit_sync_applied(self, payload):
+        self.calls.append(("sync", payload))
 
     async def emit_projects_changed(self):
         self.calls.append(("projects",))
@@ -533,6 +552,9 @@ class RealtimeSyncOrderingTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertNotIn(("emit", "m-deleted"), probe.calls)
         self.assertIn(("emit", "m-live"), probe.calls)
+        sync_payload = next(call[1] for call in probe.calls if call[0] == "sync")
+        self.assertEqual(set(sync_payload), {"origin", "appliedAt"})
+        self.assertNotIn("m-live", str(sync_payload))
 
     async def test_push_revalidates_rooms_for_membership_and_memo_changes(self) -> None:
         probe = _RealtimeProbe()

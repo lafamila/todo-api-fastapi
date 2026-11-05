@@ -320,8 +320,9 @@ async def create_project(data: CreateProjectRequest, user: dict = Depends(get_cu
                      user.get("email"), now, now_utc),
                 )
             cursor.execute(
-                "SELECT id FROM memos WHERE project_id = %s AND kind = 'backlog' AND deleted_at IS NULL LIMIT 1",
-                (project_id,),
+                "SELECT id FROM memos WHERE project_id = %s AND kind = 'backlog' "
+                "AND created_by = %s AND deleted_at IS NULL LIMIT 1",
+                (project_id, owner_id),
             )
             if not cursor.fetchone():
                 cursor.execute(
@@ -329,7 +330,14 @@ async def create_project(data: CreateProjectRequest, user: dict = Depends(get_cu
                        (id, project_id, created_by, kind, title, content, status,
                         created_at, updated_at, updated_at_utc)
                        VALUES (%s, %s, %s, 'backlog', '백로그', '', 0, %s, %s, %s)""",
-                    (backlog_id(project_id), project_id, owner_id, now, now, now_utc),
+                    (
+                        backlog_id(project_id, owner_id),
+                        project_id,
+                        owner_id,
+                        now,
+                        now,
+                        now_utc,
+                    ),
                 )
     result = _serialize_project({
         "id": project_id, "name": data.name.strip(), "icon": data.icon, "status": 0,

@@ -17,7 +17,8 @@ import unicodedata
 #   1 — (가상) 동기화 도입 이전 스키마
 #   2 — updated_at_utc / tombstone / memo_versions.note / change_log 도입
 #   3 — project hierarchy/group + memo kind(backlog) 도입
-SCHEMA_VERSION = 3
+#   4 — account-private backlog semantics + attachment metadata 도입
+SCHEMA_VERSION = 4
 
 # FK 의존성 순서 — push 적용은 반드시 이 순서를 따른다.
 # (오프라인에서 "프로젝트 생성 → 그 안에 메모 생성" 이 흔하다.)
@@ -25,6 +26,7 @@ SYNC_TABLE_ORDER: tuple[str, ...] = (
     "projects",
     "memos",
     "memo_versions",
+    "memo_attachments",
     "project_members",
 )
 
@@ -83,6 +85,29 @@ SYNC_TABLES: dict[str, dict] = {
             "note",
             "created_at",
             "updated_at_utc",
+        ),
+        "parents": (("memo_id", "memos"),),
+        "duplicate_scope": None,
+        "duplicate_column": None,
+        "duplicate_kind": None,
+    },
+    "memo_attachments": {
+        "pk": "id",
+        "columns": (
+            "id",
+            "memo_id",
+            "origin_memo_id",
+            "created_by",
+            "file_name",
+            "content_type",
+            "byte_size",
+            "is_image",
+            "sha256",
+            "object_key",
+            "status",
+            "created_at",
+            "updated_at_utc",
+            "deleted_at",
         ),
         "parents": (("memo_id", "memos"),),
         "duplicate_scope": None,

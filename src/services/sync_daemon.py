@@ -257,7 +257,8 @@ class SyncDaemon:
             with conn.cursor() as cursor:
                 self._check_identity(cursor, handshake)
 
-        push_report = self._push_rounds(columns_by_table)
+        account_id = str(handshake.get("accountId") or "")
+        push_report = self._push_rounds(columns_by_table, account_id)
         pull_report = self._pull_rounds(columns_by_table)
 
         with get_db_connection() as conn:
@@ -286,11 +287,11 @@ class SyncDaemon:
                 f"로컬 스키마가 앞서 있습니다 (로컬 {SCHEMA_VERSION} > 원격 {peer_version}). "
                 "원격 배포 후 재개하세요."
             )
-            if peer_version < 3 <= SCHEMA_VERSION:
+            if peer_version < 4 <= SCHEMA_VERSION:
                 raise SyncBlocked(
                     "schema",
                     message
-                    + " hierarchy/backlog 스키마는 공통 필드 모드로 안전하게 축소할 수 없습니다.",
+                    + " private backlog/attachment 스키마는 공통 필드 모드로 안전하게 축소할 수 없습니다.",
                     {"local": SCHEMA_VERSION, "peer": peer_version},
                 )
             if not SYNC_ALLOW_SCHEMA_DRIFT:
@@ -401,7 +402,11 @@ class SyncDaemon:
             detail,
         )
 
-    def _push_rounds(self, columns_by_table: dict[str, tuple[str, ...]]) -> dict:
+    def _push_rounds(
+        self,
+        columns_by_table: dict[str, tuple[str, ...]],
+        account_id: str | None = None,
+    ) -> dict:
         report = {
             "rounds": 0,
             "applied": 0,
@@ -411,7 +416,7 @@ class SyncDaemon:
             "deferred": [],
             "rejected": [],
         }
-        self._merge_push_report(report, self._retry_push_queue())
+        self._merge_push_report(report, self._retry_push_queue(account_id))
 
         # 네트워크 호출 전에 현재 행 snapshot을 queue에 고정하고 같은 트랜잭션에서
         # scan watermark를 진행한다. 응답 유실 뒤 행이 다시 수정돼도 같은 source seq는
@@ -427,6 +432,7 @@ class SyncDaemon:
                         SYNC_BATCH_LIMIT,
                         columns_by_table or None,
                         peer=self.client_id,
+                        account_id=account_id,
                     )
                     if not changes:
                         break
@@ -443,7 +449,7 @@ class SyncDaemon:
             if len(changes) < SYNC_BATCH_LIMIT:
                 break
 
-        self._merge_push_report(report, self._retry_push_queue())
+        self._merge_push_report(report, self._retry_push_queue(account_id))
         return report
 
     @staticmethod
@@ -454,7 +460,7 @@ class SyncDaemon:
         for key in ("conflicts", "duplicates", "deferred", "rejected"):
             target[key].extend(source.get(key) or [])
 
-    def _retry_push_queue(self) -> dict:
+    def _retry_push_queue(self, account_id: str | None = None) -> dict:
         """이전 cycle에서 실패한 push를 새 change_log 구간과 독립적으로 재시도한다."""
         report = {
             "applied": 0,
@@ -470,6 +476,27 @@ class SyncDaemon:
                 queued = list_sync_retries(
                     cursor, self.client_id, "push", SYNC_BATCH_LIMIT
                 )
+                if account_id:
+                    try:
+                        from .sync_store import sync_row_pushable_by_account
+                    except ImportError:  # pragma: no cover
+                        from services.sync_store import sync_row_pushable_by_account
+                    visible = []
+                    for entry in queued:
+                        change = entry["change"]
+                        if sync_row_pushable_by_account(
+                            cursor,
+                            str(change.get("table") or ""),
+                            change.get("row"),
+                            account_id,
+                        ):
+                            visible.append(entry)
+                        else:
+                            # Never put another account's private backlog metadata on wire.
+                            delete_sync_retry(
+                                cursor, self.client_id, "push", int(entry["seq"])
+                            )
+                    queued = visible
                 delivery_client_id = (
                     f"{self.client_id}:{get_client_epoch(cursor, self.client_id)}"
                 )
@@ -874,22 +901,6 @@ class SyncDaemon:
             {
                 "origin": "sync-pull",
                 "appliedAt": iso_utc(utcnow_naive()),
-                "changes": [
-                    {
-                        "table": entry["table"],
-                        "rowId": entry["rowId"],
-                        "updatedAtUtc": (entry.get("row") or {}).get("updated_at_utc"),
-                    }
-                    for entry in applied_rows
-                ],
-                "memoIds": [
-                    entry["rowId"] for entry in applied_rows if entry.get("table") == "memos"
-                ],
-                "projectIds": [
-                    entry["rowId"] for entry in applied_rows if entry.get("table") == "projects"
-                ],
-                "conflicts": pull.get("conflicts") or [],
-                "duplicates": pull.get("duplicates") or [],
             }
         )
 

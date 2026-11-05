@@ -45,11 +45,12 @@ src/
 ├── utils.py
 ├── connectors/
 │   └── __init__.py       # DB config, get_db_connection(sync_applying=), init_db() DDL+트리거
-├── models/               # Pydantic 모델 (auth, base, daily_tasks)
-├── routers/              # APIRouter 모듈 — auth, projects, memos, articles, daily_tasks, sync
+├── models/               # Pydantic 모델 (auth, base, daily_tasks, attachments)
+├── routers/              # APIRouter 모듈 — auth, projects, memos, attachments, articles, daily_tasks, sync
 └── services/             # session_auth(OIDC+오프라인 세션), realtime(Socket.IO), livekit,
                           # merge(중복 병합), lock_registry(락 단일 진실),
                           # memo_search(프로젝트 현재 메모 BM25 순위·강조 문맥),
+                          # attachment_schema/additive DDL · attachment_storage/stdlib SigV4 private S3,
                           # sync_auth(credential 검증) · sync_store(change_log/state/issues) ·
                           # sync_apply(LWW·중복 정책) · sync_peer(원격 호출) ·
                           # sync_daemon(push/pull 루프) · sync_runtime(온라인 상태) · http_json
@@ -185,13 +186,14 @@ prod 전용 표면(화면공유·게시·멤버초대) 숨김 판정 축은 **�
 
 ## DATABASE SCHEMA
 
-`src/connectors/__init__.py` `init_db()` 의 DDL 이 canonical 이다. 데이터 테이블 7개 +
+`src/connectors/__init__.py` `init_db()` 의 DDL 이 canonical 이다. 데이터 테이블 8개 +
 동기화용 4개(`change_log`·`sync_state`·`sync_issues`·`local_identity`, 위 OFFLINE SYNC 참조):
 
 ```text
 projects               (id PK, owner_id, parent_id[직접 자식 1단계], is_group[영구 전환], name, icon, status, is_secret, password[legacy], created_at, updated_at, updated_at_utc, deleted_at)
 memos                  (id PK, project_id FK→projects, created_by, kind[memo|backlog], title, content LONGTEXT, status, deleted_at, created_at, updated_at, updated_at_utc)
 memo_versions          (id PK, memo_id FK→memos, content LONGTEXT, version INT, note, created_at, updated_at_utc)
+memo_attachments       (id PK, memo_id FK→memos, origin_memo_id[object key 불변 원본], created_by, file_name, content_type, byte_size, is_image, sha256, object_key UNIQUE, status, created_at, updated_at_utc, deleted_at)
 articles               (id PK, memo_id FK→memos UNIQUE, project_id FK→projects, author_id, author_slug, title, content, published_version, ...)
 project_members        (id PK, project_id FK→projects, user_id, username, display_name, email, role, invited_at, updated_at_utc, deleted_at; UNIQUE(project_id,user_id))
 daily_task_types       (id PK, name UNIQUE, icon, color, display_order, is_active, ...)
@@ -254,9 +256,15 @@ null/누락/빈 문자열이면 `loginId`와 `username`을 빈 문자열로 반�
   room/lease를 재검증한다. sync raw move도 양쪽 실제 root owner가 같을 때만 cross-root를 허용한다.
 - `PATCH /api/projects/{id}`는 owner 역할만 이름을 변경하며 공백/255자 초과/같은 hierarchy scope 중복을
   거부한다. `updated_at`(KST)과 `updated_at_utc`(sync clock)를 함께 갱신하고 관계·멤버십은 바꾸지 않는다.
-- 새 leaf는 생성 트랜잭션에서 결정적 ID의 빈 `kind=backlog` 메모를 함께 만들고, 기존 leaf는
-  원자적 get-or-create로 복구한다. leaf마다 live backlog는 최대 하나다. 저장·version·lease·CAS는
-  일반 메모 계약을 그대로 사용하며 일반 메모 목록/검색/게시/수동 이동에서는 제외한다.
+- backlog는 `(project_id, created_by)` 계정별 비공개 메모다. 새 leaf는 owner의 결정적 ID backlog를
+  함께 만들고, 다른 멤버는 첫 open에서 `backlog_id(project,user)`로 원자적 생성한다. viewer도 자기
+  backlog는 lease/CAS/version 경로로 편집하지만 다른 멤버·프로젝트 owner·service owner는 타인의
+  본문/버전/소켓/첨부/동기화 issue를 볼 수 없다. 일반 메모 공유 규칙은 그대로다. legacy shared
+  backlog는 기록된 creator를 유지하고 NULL이면 project owner로 보정하되 ID/content/history/time을 보존한다.
+- 첨부 metadata의 현재 논리 소속은 `memo_id`, R2 key의 불변 원본은 `origin_memo_id`다. 따라서 memo/
+  project merge에서도 object copy 없이 attachment association을 안전하게 옮긴다. 브라우저에는 key/bucket/
+  credential을 노출하지 않고 인증 API만 제공한다. object key는 서버가
+  `todo/memos/{originMemoId}/{attachmentId}`로 계산하며 private backlog 첨부는 parent memo privacy를 상속한다.
 - 삭제는 정확한 프로젝트명 확인과 실제 `owner_id` 일치를 모두 요구한다. group은 현재 자식까지
   recursive tombstone 처리하되 프로젝트·메모·버전·게시글 행을 물리 삭제하지 않는다. 공개 게시글과
   REST/Socket.IO 직접 접근도 live ancestor를 확인한다.
@@ -296,13 +304,19 @@ NAS 원격을 **단일 진실**로 두고, 노트북 로컬 스택을 outbox 를
 
 ### 스키마 (`src/connectors/__init__.py` `init_db()` 가 canonical)
 
-동기화 대상 4개 테이블(`projects`·`memos`·`memo_versions`·`project_members`)에 추가된 것:
+동기화 대상 5개 테이블(`projects`·`memos`·`memo_versions`·`memo_attachments`·`project_members`)에 추가된 것:
 
 ```text
 updated_at_utc DATETIME(3) NOT NULL   -- 충돌 판정(LWW)의 유일한 근거. 항상 UTC
 deleted_at     DATETIME(3) NULL       -- projects / project_members 에 신규 (memos 는 기존)
 memo_versions.note VARCHAR(255) NULL  -- "충돌 · 로컬 (07-29 14:02)" / "병합 · {제목} (…)"
 ```
+
+현재 `SCHEMA_VERSION=4`다. v4는 backlog owner privacy와 attachment metadata를 권한 경계로
+사용하므로 v3 이하 peer는 `allowSchemaDrift` 여부와 무관하게 push/pull 모두 fail-closed 한다.
+backlog memo/version/attachment/issue/lock은 exact `created_by` 계정+live membership으로 scope하고,
+일반 memo attachment는 기존 공유 범위를 따른다. object bytes는 동기화하지 않으며 양쪽 노드는 같은
+private bucket/prefix를 사용해야 한다.
 
 노드 로컬 테이블 (동기화 대상 아님):
 
@@ -322,7 +336,7 @@ local_identity (account_id PK, login_id, display_name, email, permission, issuer
 
 ### 트리거 (change_log 를 채운다)
 
-테이블당 insert/update/delete 3개, 총 12개 (`trg_{table}_{ai|au|ad}_change_log`).
+테이블당 insert/update/delete 3개, 총 15개 (`trg_{table}_{ai|au|ad}_change_log`).
 앱의 쓰기 지점 20여 곳을 각각 고치는 것보다 누락이 없고, 마이그레이션 스크립트나 손으로 실행한
 SQL 까지 잡힌다. 본문은 `IF @sync_applying IS NULL THEN … END IF` 로 감싼다:
 
@@ -508,6 +522,7 @@ import 순서에 의존하지 말고 반드시 `use_scratch_database()` 를 쓴�
 | Auth/session | `routers/auth.py` | `POST /api/session/oidc/start`, `POST /api/session/logout`, `GET /api/session/me`, `POST /api/session/local`(오프라인 로그인), `GET /api/session/local/identity`, `POST /api/session/service-application`, `GET /api/users/search`, `POST /api/livekit/token` |
 | Projects | `routers/projects.py` | `GET/POST /api/projects`(parentProjectId로 자식 생성), `PATCH /api/projects/{id}`(owner rename), `DELETE /api/projects/{id}`(이름확인·recursive soft), `POST /api/projects/{id}/verify`, 병합 `POST /api/projects/{loserId}/merge-into/{winnerId}`, 멤버 snapshot 초대 `GET/POST /api/projects/{id}/members`, `DELETE /api/projects/{id}/members/{userId}`(soft) |
 | Memos | `routers/memos.py` | `GET /api/projects/{id}/memos`, `GET/POST /api/projects/{id}/backlog`, `POST /api/memos`, `GET/PUT/DELETE /api/memos/{id}`, `POST /api/memos/{id}/move`, `POST /api/memos/bulk-move`, `POST /api/memos/bulk-delete`, 버전 `GET /api/memos/{id}/versions[/{v}]`, 병합 `POST /api/memos/{loserId}/merge-into/{winnerId}` |
+| Attachments | `routers/attachments.py` | `GET/POST /api/memos/{id}/attachments`, `POST /api/memos/{id}/attachments/download`, `GET /api/attachments/{id}/content` — private storage proxy, single original/multi ZIP |
 | Sync | `routers/sync.py` | 피어: `handshake`·`changes`·`push`·`locks/*`·`merge/*` (service credential) / UI: `status`·`issues`·`issues/resolve`·`pause`·`trigger` (세션) |
 | Articles | `routers/articles.py` | `POST/GET /api/articles`, `GET /api/articles/boards/{slug}`, `GET/DELETE /api/articles/{id}`, `GET /api/memos/{id}/article` |
 | Daily tasks | `routers/daily_tasks.py` | `/api/daily-tasks` prefix — `POST/GET/PUT/DELETE .../types[/{id}]`, `POST .../complete`, `DELETE .../complete/{typeId}/{date}`, `GET .../calendar[/{date}]` |

@@ -18,7 +18,15 @@ try:
     from ..services.memo_search import search_memos, validate_search_query
     from ..services.realtime import get_realtime_server
     from ..timeutil import iso_utc, localnow_naive, utcnow_naive
-    from ..utils import backlog_id, can_manage_project, can_write_project, check_project_membership, generate_id
+    from ..utils import (
+        backlog_id,
+        can_manage_project,
+        can_write_project,
+        check_explicit_project_membership,
+        check_project_membership,
+        generate_id,
+        require_memo_access,
+    )
 except ImportError:  # pragma: no cover
     from auth_utils import get_current_user, require_admin
     from connectors import get_db_connection
@@ -33,7 +41,15 @@ except ImportError:  # pragma: no cover
     from services.memo_search import search_memos, validate_search_query
     from services.realtime import get_realtime_server
     from timeutil import iso_utc, localnow_naive, utcnow_naive
-    from utils import backlog_id, can_manage_project, can_write_project, check_project_membership, generate_id
+    from utils import (
+        backlog_id,
+        can_manage_project,
+        can_write_project,
+        check_explicit_project_membership,
+        check_project_membership,
+        generate_id,
+        require_memo_access,
+    )
 
 
 router = APIRouter(prefix="/api", tags=["memos"])
@@ -340,16 +356,17 @@ async def create_memo(data: CreateMemoRequest, user: dict = Depends(get_current_
 
 @router.get("/projects/{project_id}/backlog")
 async def get_project_backlog(project_id: str, user: dict = Depends(get_current_user)):
-    """leaf 프로젝트의 공유 백로그를 조회한다. 아직 없으면 null이다."""
+    """현재 계정의 비공개 backlog를 조회한다. 아직 없으면 null이다."""
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             _require_leaf_project(cursor, project_id)
-            if not check_project_membership(cursor, project_id, user):
+            if not check_explicit_project_membership(cursor, project_id, user["id"]):
                 raise HTTPException(status_code=403, detail="Access denied")
             cursor.execute(
                 f"SELECT {MEMO_COLUMNS} FROM memos "
-                "WHERE project_id = %s AND kind = 'backlog' AND deleted_at IS NULL LIMIT 1",
-                (project_id,),
+                "WHERE project_id = %s AND kind = 'backlog' AND created_by = %s "
+                "AND deleted_at IS NULL LIMIT 1",
+                (project_id, user["id"]),
             )
             memo = cursor.fetchone()
             return _serialize_memo(memo) if memo else None
@@ -357,22 +374,23 @@ async def get_project_backlog(project_id: str, user: dict = Depends(get_current_
 
 @router.post("/projects/{project_id}/backlog", status_code=201)
 async def create_project_backlog(project_id: str, user: dict = Depends(get_current_user)):
-    """프로젝트 행 잠금 + 결정적 ID로 백로그를 get-or-create한다."""
+    """프로젝트+현재 계정 범위의 비공개 backlog를 get-or-create한다."""
     now, now_utc = localnow_naive(), utcnow_naive()
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             _require_leaf_project(cursor, project_id, for_update=True)
-            if not can_write_project(cursor, project_id, user):
+            if not check_explicit_project_membership(cursor, project_id, user["id"]):
                 raise HTTPException(status_code=403, detail="Access denied")
             cursor.execute(
                 f"SELECT {MEMO_COLUMNS} FROM memos "
-                "WHERE project_id = %s AND kind = 'backlog' AND deleted_at IS NULL LIMIT 1",
-                (project_id,),
+                "WHERE project_id = %s AND kind = 'backlog' AND created_by = %s "
+                "AND deleted_at IS NULL LIMIT 1",
+                (project_id, user["id"]),
             )
             existing = cursor.fetchone()
             if existing:
                 return _serialize_memo(existing)
-            memo_id = backlog_id(project_id)
+            memo_id = backlog_id(project_id, user["id"])
             # 부모에서 첫 자식으로 이동한 backlog는 ID가 부모 기반이어도 kind 조회로 재사용한다.
             cursor.execute("SELECT id FROM memos WHERE id = %s", (memo_id,))
             if cursor.fetchone():
@@ -408,6 +426,7 @@ async def move_memo(
             initial_memo = cursor.fetchone()
             if not initial_memo:
                 raise HTTPException(status_code=404, detail="Memo not found")
+            require_memo_access(cursor, memo_id, user)
             if initial_memo["kind"] == "backlog":
                 raise HTTPException(status_code=422, detail="Backlogs cannot be moved manually")
             source_project_id = initial_memo["project_id"]
@@ -497,6 +516,8 @@ async def bulk_move_memos(
                 raise HTTPException(status_code=404, detail="One or more memos were not found")
             if any(memo["deleted_at"] is not None for memo in selected):
                 raise HTTPException(status_code=404, detail="One or more memos were not found")
+            for memo_id in data.memoIds:
+                require_memo_access(cursor, memo_id, user)
             if any(memo.get("kind") != "memo" for memo in selected):
                 raise HTTPException(status_code=422, detail="Only regular memos can be moved")
             if any(memo["project_id"] != data.sourceProjectId for memo in selected):
@@ -569,24 +590,7 @@ async def get_memo(memo_id: str, user: dict = Depends(get_current_user)):
     """메모 조회"""
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute(
-                f"""
-                SELECT {MEMO_COLUMNS}
-                FROM memos
-                WHERE id = %s AND deleted_at IS NULL
-            """,
-                (memo_id,),
-            )
-            memo = cursor.fetchone()
-
-            if not memo:
-                raise HTTPException(status_code=404, detail="Memo not found")
-
-            _require_leaf_project(cursor, memo["project_id"])
-            if not check_project_membership(cursor, memo["project_id"], user):
-                raise HTTPException(status_code=403, detail="Access denied")
-
-            return _serialize_memo(memo)
+            return _serialize_memo(require_memo_access(cursor, memo_id, user))
 
 
 @router.put("/memos/{memo_id}")
@@ -600,17 +604,12 @@ async def update_memo(
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT * FROM memos WHERE id = %s AND deleted_at IS NULL FOR UPDATE",
+                "SELECT id FROM memos WHERE id = %s AND deleted_at IS NULL FOR UPDATE",
                 (memo_id,),
             )
-            memo = cursor.fetchone()
-
-            if not memo:
+            if not cursor.fetchone():
                 raise HTTPException(status_code=404, detail="Memo not found")
-
-            _require_leaf_project(cursor, memo["project_id"])
-            if not can_write_project(cursor, memo["project_id"], user):
-                raise HTTPException(status_code=403, detail="Access denied")
+            memo = require_memo_access(cursor, memo_id, user, write=True)
 
             _require_memo_write_lease(memo_id, user["id"], lease_token)
 
@@ -688,17 +687,7 @@ async def get_memo_versions(
     """메모의 버전 히스토리 조회 (충돌·병합 보존 버전은 `note` 로 구분된다)"""
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute(
-                "SELECT id, project_id FROM memos WHERE id = %s AND deleted_at IS NULL",
-                (memo_id,),
-            )
-            memo = cursor.fetchone()
-            if not memo:
-                raise HTTPException(status_code=404, detail="Memo not found")
-
-            _require_leaf_project(cursor, memo["project_id"])
-            if not check_project_membership(cursor, memo["project_id"], user):
-                raise HTTPException(status_code=403, detail="Access denied")
+            require_memo_access(cursor, memo_id, user)
 
             content_column = ", content" if include_content else ""
             cursor.execute(
@@ -723,17 +712,7 @@ async def get_memo_version(
     """특정 버전의 메모 내용 조회"""
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute(
-                "SELECT id, project_id FROM memos WHERE id = %s AND deleted_at IS NULL",
-                (memo_id,),
-            )
-            memo = cursor.fetchone()
-            if not memo:
-                raise HTTPException(status_code=404, detail="Memo not found")
-
-            _require_leaf_project(cursor, memo["project_id"])
-            if not check_project_membership(cursor, memo["project_id"], user):
-                raise HTTPException(status_code=403, detail="Access denied")
+            require_memo_access(cursor, memo_id, user)
 
             cursor.execute(
                 """
@@ -764,14 +743,7 @@ async def merge_memo_into(
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             for memo_id in (loser_id, winner_id):
-                cursor.execute(
-                    "SELECT project_id FROM memos WHERE id = %s AND deleted_at IS NULL",
-                    (memo_id,),
-                )
-                memo = cursor.fetchone()
-                if not memo:
-                    raise HTTPException(status_code=404, detail=f"Memo not found: {memo_id}")
-                _require_leaf_project(cursor, memo["project_id"])
+                memo = require_memo_access(cursor, memo_id, user)
                 if not can_manage_project(cursor, memo["project_id"], user):
                     raise HTTPException(status_code=403, detail="Access denied")
 
@@ -786,21 +758,11 @@ async def delete_memo(memo_id: str, user: dict = Depends(get_current_user)):
     """메모 소프트 삭제"""
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT m.id, m.project_id, p.owner_id
-                FROM memos m
-                JOIN projects p ON m.project_id = p.id
-                WHERE m.id = %s AND m.deleted_at IS NULL
-            """,
-                (memo_id,),
-            )
-            memo = cursor.fetchone()
-            if not memo:
-                raise HTTPException(status_code=404, detail="Memo not found")
-
-            _require_leaf_project(cursor, memo["project_id"])
-            if not can_manage_project(cursor, memo["project_id"], user):
+            memo = require_memo_access(cursor, memo_id, user)
+            if memo.get("kind") == "backlog":
+                if memo.get("created_by") != user["id"]:
+                    raise HTTPException(status_code=403, detail="Access denied")
+            elif not can_manage_project(cursor, memo["project_id"], user):
                 raise HTTPException(status_code=403, detail="Access denied")
 
             now_utc = utcnow_naive()
@@ -824,22 +786,14 @@ async def bulk_delete_memos(
             now_utc = utcnow_naive()
             deleted_count = 0
             for memo_id in data.memoIds:
-                cursor.execute(
-                    """
-                    SELECT project_id
-                    FROM memos
-                    WHERE id = %s AND deleted_at IS NULL
-                    """,
-                    (memo_id,),
-                )
-                memo = cursor.fetchone()
-                if not memo:
-                    continue
                 try:
-                    _require_leaf_project(cursor, memo["project_id"])
+                    memo = require_memo_access(cursor, memo_id, user)
                 except HTTPException:
                     continue
-                if not can_manage_project(cursor, memo["project_id"], user):
+                if memo.get("kind") == "backlog":
+                    if memo.get("created_by") != user["id"]:
+                        continue
+                elif not can_manage_project(cursor, memo["project_id"], user):
                     continue
                 cursor.execute(
                     "UPDATE memos SET deleted_at = %s, updated_at_utc = %s "

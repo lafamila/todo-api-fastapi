@@ -58,8 +58,8 @@ class _Cursor:
     def execute(self, query: str, params=None) -> None:
         normalized = " ".join(query.split())
         self.statements.append((normalized, params))
-        if normalized.startswith("SELECT * FROM memos"):
-            self._result = self.memo.copy()
+        if normalized.startswith("SELECT id FROM memos"):
+            self._result = {"id": self.memo["id"]}
         elif normalized.startswith("SELECT p.id, p.owner_id, p.parent_id, p.is_group"):
             self._result = {
                 "id": params[0], "owner_id": "user-1", "parent_id": None, "is_group": 0,
@@ -110,7 +110,9 @@ class MemoCasUpdateTests(unittest.IsolatedAsyncioTestCase):
     async def _update(self, base_revision: str | None):
         with (
             patch.object(memos, "get_db_connection", self._connection),
-            patch.object(memos, "can_write_project", return_value=True),
+            patch.object(
+                memos, "require_memo_access", return_value=self.cursor.memo.copy()
+            ),
             patch.object(memos, "_require_memo_write_lease") as require_lease,
             patch.object(
                 memos,

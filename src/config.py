@@ -239,6 +239,12 @@ def _get_int(name: str, default: str) -> int:
     return int(_env(name, default))
 
 
+def _get_optional_int(name: str, default: str) -> int:
+    """Parse new optional settings while treating an explicit empty env as unset."""
+    raw = _env(name, None)
+    return int(raw) if raw is not None and raw.strip() else int(default)
+
+
 def _get_csv(name: str, default: str) -> list[str]:
     raw = _env(name, default)
     return [item.strip() for item in raw.split(",") if item.strip()]
@@ -418,6 +424,39 @@ LIVEKIT_URL = _env("LIVEKIT_URL", "").strip()
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "").strip()  # 비밀
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "").strip()  # 비밀
 
+# Private memo attachments. Disabled is an ordinary runtime state: the API and
+# existing memo features still start, while attachment endpoints return 503
+# until a private S3-compatible bucket is configured.
+TODO_ATTACHMENT_STORAGE_ENABLED = _get_bool(
+    "TODO_ATTACHMENT_STORAGE_ENABLED", False
+)
+STORAGE_BACKEND = _env("STORAGE_BACKEND", "localstack").strip().lower()
+S3_ENDPOINT_URL = (
+    _env("S3_ENDPOINT_URL", "http://localhost:4566").strip().rstrip("/")
+)
+S3_BUCKET_NAME = _env("S3_BUCKET_NAME", "teddy-todo-attachments").strip()
+S3_REGION = _env("S3_REGION", "ap-northeast-2").strip()
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "").strip()
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "").strip()
+TODO_ATTACHMENT_MAX_FILE_BYTES = _get_optional_int(
+    "TODO_ATTACHMENT_MAX_FILE_BYTES", "52428800"
+)
+TODO_ATTACHMENT_MAX_COUNT_PER_MEMO = _get_optional_int(
+    "TODO_ATTACHMENT_MAX_COUNT_PER_MEMO", "100"
+)
+TODO_ATTACHMENT_MAX_ZIP_BYTES = _get_optional_int(
+    "TODO_ATTACHMENT_MAX_ZIP_BYTES", "209715200"
+)
+TODO_ATTACHMENT_SPOOL_BYTES = _get_optional_int(
+    "TODO_ATTACHMENT_SPOOL_BYTES", "8388608"
+)
+TODO_ATTACHMENT_STORAGE_TIMEOUT_SECONDS = _get_optional_int(
+    "TODO_ATTACHMENT_STORAGE_TIMEOUT_SECONDS", "30"
+)
+TODO_ATTACHMENT_UPLOAD_STALE_SECONDS = _get_optional_int(
+    "TODO_ATTACHMENT_UPLOAD_STALE_SECONDS", "3600"
+)
+
 
 def settings_snapshot() -> dict:
     """확정된 설정 요약 (비밀은 존재 여부만). `todoctl status`·테스트·진단용."""
@@ -448,6 +487,17 @@ def settings_snapshot() -> dict:
         "TODO_LOCAL_SESSION_ENABLED": TODO_LOCAL_SESSION_ENABLED,
         "TODO_SESSION_DB_PERSISTENCE": TODO_SESSION_DB_PERSISTENCE,
         "LIVEKIT_URL": LIVEKIT_URL,
+        "TODO_ATTACHMENT_STORAGE_ENABLED": TODO_ATTACHMENT_STORAGE_ENABLED,
+        "STORAGE_BACKEND": STORAGE_BACKEND,
+        "S3_ENDPOINT_URL": S3_ENDPOINT_URL,
+        "S3_BUCKET_NAME": S3_BUCKET_NAME,
+        "S3_REGION": S3_REGION,
+        "TODO_ATTACHMENT_MAX_FILE_BYTES": TODO_ATTACHMENT_MAX_FILE_BYTES,
+        "TODO_ATTACHMENT_MAX_COUNT_PER_MEMO": TODO_ATTACHMENT_MAX_COUNT_PER_MEMO,
+        "TODO_ATTACHMENT_MAX_ZIP_BYTES": TODO_ATTACHMENT_MAX_ZIP_BYTES,
+        "TODO_ATTACHMENT_SPOOL_BYTES": TODO_ATTACHMENT_SPOOL_BYTES,
+        "TODO_ATTACHMENT_STORAGE_TIMEOUT_SECONDS": TODO_ATTACHMENT_STORAGE_TIMEOUT_SECONDS,
+        "TODO_ATTACHMENT_UPLOAD_STALE_SECONDS": TODO_ATTACHMENT_UPLOAD_STALE_SECONDS,
         "SYNC_ENABLED": SYNC_ENABLED,
         "SYNC_PEER_URL": SYNC_PEER_URL,
         "SYNC_CLIENT_ID": SYNC_CLIENT_ID,
@@ -475,6 +525,8 @@ def settings_snapshot() -> dict:
             "SYNC_ACCOUNT_ID": bool(SYNC_ACCOUNT_ID),
             "LIVEKIT_API_KEY": bool(LIVEKIT_API_KEY),
             "LIVEKIT_API_SECRET": bool(LIVEKIT_API_SECRET),
+            "AWS_ACCESS_KEY_ID": bool(AWS_ACCESS_KEY_ID),
+            "AWS_SECRET_ACCESS_KEY": bool(AWS_SECRET_ACCESS_KEY),
         },
     }
 
