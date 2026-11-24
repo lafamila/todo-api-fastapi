@@ -587,8 +587,8 @@ class PrivateMediaTwoNodeTests(unittest.TestCase):
 
 
 class V4SchemaTests(unittest.TestCase):
-    def test_v4_declares_attachment_dependency_after_memos(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 4)
+    def test_v5_keeps_attachment_dependency_after_memos(self) -> None:
+        self.assertEqual(SCHEMA_VERSION, 5)
         self.assertIn("memo_attachments", declared_tables())
         self.assertLess(
             SYNC_TABLE_ORDER.index("memos"),

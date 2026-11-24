@@ -112,6 +112,18 @@ def _local_identity_row(cursor) -> dict | None:
     return cursor.fetchone()
 
 
+def _task_rollup_actor_ids(cursor) -> list[str]:
+    cursor.execute(
+        """
+        SELECT DISTINCT actor_id
+        FROM task_rollup_completions
+        WHERE actor_id IS NOT NULL AND actor_id <> ''
+        ORDER BY actor_id
+        """
+    )
+    return [str(row["actor_id"]) for row in cursor.fetchall()]
+
+
 # ---------------------------------------------------------------------------
 # doctor
 # ---------------------------------------------------------------------------
@@ -126,6 +138,7 @@ def cmd_doctor(args: Namespace) -> int:
             max_seq = max_change_seq(cursor)
             pending = pending_change_count(cursor, int(state["last_pushed_seq"]))
             owner_ids = distinct_owner_ids(cursor)
+            rollup_actor_ids = _task_rollup_actor_ids(cursor)
             counts = _table_counts(cursor)
             triggers = _trigger_count(cursor)
             issues = unresolved_issue_counts(cursor)
@@ -151,6 +164,7 @@ def cmd_doctor(args: Namespace) -> int:
         "lastError": state["last_error"],
         "rowCounts": counts,
         "localOwnerIds": owner_ids,
+        "taskRollupActorIds": rollup_actor_ids,
         "localIdentityFromData": (
             {
                 "userId": local_member["user_id"],
@@ -571,6 +585,7 @@ def _bootstrap_blockers(
     local_counts: dict[str, int],
     target_fingerprint: dict,
     local_server_identity: dict | None,
+    rollup_actor_ids: list[str] | None = None,
 ) -> list[str]:
     """파괴적 bootstrap 전에 반드시 만족해야 하는, 우회 불가능한 불변조건."""
     blockers: list[str] = []
@@ -613,6 +628,14 @@ def _bootstrap_blockers(
             blockers.append(
                 f"owner id가 원격 계정과 다릅니다 {mismatched} != {remote_account} "
                 "— link-identity 먼저"
+            )
+        mismatched_rollup_actors = [
+            actor for actor in (rollup_actor_ids or []) if actor != remote_account
+        ]
+        if mismatched_rollup_actors:
+            blockers.append(
+                "task rollup actor id가 원격 계정과 다릅니다 "
+                f"{mismatched_rollup_actors} != {remote_account}"
             )
     if (
         local_server_identity
@@ -665,6 +688,7 @@ def cmd_bootstrap(args: Namespace) -> int:
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             owner_ids = distinct_owner_ids(cursor)
+            rollup_actor_ids = _task_rollup_actor_ids(cursor)
             identity_cache = get_local_identity(cursor)
             local_counts = _table_counts(cursor)
             local_max_seq = max_change_seq(cursor)
@@ -675,6 +699,7 @@ def cmd_bootstrap(args: Namespace) -> int:
     print(f"  로컬 DB           : {DB_CONFIG['database']} @ {DB_CONFIG['host']}:{DB_CONFIG['port']}")
     print(f"  원격 DB           : {args.target_database} @ {args.target_host}:{args.target_port}")
     print(f"  로컬 owner id     : {owner_ids}")
+    print(f"  rollup actor id   : {rollup_actor_ids}")
     print(f"  신원 캐시         : {'있음' if identity_cache else '없음'}")
     print(f"  로컬 행 수        : {local_counts}")
     print(f"  로컬 max(seq)     : {local_max_seq}")
@@ -698,6 +723,7 @@ def cmd_bootstrap(args: Namespace) -> int:
         local_counts=local_counts,
         target_fingerprint=target_fingerprint,
         local_server_identity=local_server_identity,
+        rollup_actor_ids=rollup_actor_ids,
     )
     if blockers:
         print("\n중단 — 다음을 먼저 해결하세요:")

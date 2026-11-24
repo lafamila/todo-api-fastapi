@@ -21,6 +21,7 @@ try:
     from .routers.memos import router as memos_router
     from .routers.projects import router as projects_router
     from .routers.sync import router as sync_router
+    from .routers.task_rollup import router as task_rollup_router
     from .services.realtime import MemoRealtimeServer, set_realtime_server
     from .services.session_auth import get_session_service
     from .services.sync_auth import AccountResolutionError, resolve_account_id
@@ -42,6 +43,7 @@ except ImportError:  # pragma: no cover
     from routers.memos import router as memos_router
     from routers.projects import router as projects_router
     from routers.sync import router as sync_router
+    from routers.task_rollup import router as task_rollup_router
     from services.realtime import MemoRealtimeServer, set_realtime_server
     from services.session_auth import get_session_service
     from services.sync_auth import AccountResolutionError, resolve_account_id
@@ -171,6 +173,7 @@ fastapi_app.include_router(articles_router)
 fastapi_app.include_router(attachments_router)
 fastapi_app.include_router(daily_tasks_router)
 fastapi_app.include_router(sync_router)
+fastapi_app.include_router(task_rollup_router)
 
 realtime_server = MemoRealtimeServer(get_session_service(), TODO_ALLOWED_ORIGINS)
 set_realtime_server(realtime_server)

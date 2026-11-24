@@ -1,8 +1,11 @@
 import asyncio
 import logging
 from collections import defaultdict
+from contextlib import suppress
+from threading import Lock
 from time import monotonic
 from urllib.parse import urlsplit
+from uuid import UUID, uuid4
 
 try:
     import socketio
@@ -23,7 +26,7 @@ try:
         can_write_project,
         check_project_membership,
     )
-    from .lock_registry import get_lock_registry
+    from .lock_registry import ReservationConflict, get_lock_registry
     from .sync_auth import (
         AccountResolutionError,
         SyncAuthError,
@@ -42,7 +45,7 @@ except ImportError:  # pragma: no cover
     )
     from connectors import get_db_connection
     from utils import can_read_memo, can_write_memo, can_write_project, check_project_membership
-    from services.lock_registry import get_lock_registry
+    from services.lock_registry import ReservationConflict, get_lock_registry
     from services.sync_auth import (
         AccountResolutionError,
         SyncAuthError,
@@ -67,6 +70,155 @@ SOCKET_SESSION_REVALIDATE_SECONDS = 30
 class LockDelegationError(RuntimeError):
     """온라인 lock 단일 진실에 접근했지만 이번 요청을 안전하게 처리하지 못했다."""
 
+    def __init__(self, message: str, code: str = "delegation_unavailable"):
+        super().__init__(message)
+        self.code = code
+
+
+def _peer_error_code(exc: SyncPeerError) -> str:
+    detail = exc.detail
+    if isinstance(detail, dict):
+        nested = detail.get("detail")
+        if isinstance(nested, dict) and nested.get("code"):
+            return str(nested["code"])
+        if detail.get("code"):
+            return str(detail["code"])
+    return "reservation_rejected"
+
+
+class TaskRollupReservationError(RuntimeError):
+    """Safe failure raised before task-rollup SQL work may begin."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+class TaskRollupReservation:
+    """Renewable fence over one canonical, already-owned memo lease set."""
+
+    def __init__(
+        self,
+        server: "MemoRealtimeServer",
+        *,
+        reservation_id: str,
+        operation_id: str,
+        user_id: str,
+        permission: str,
+        owner_key: str,
+        leases: tuple[dict, ...],
+        delegated: bool,
+    ) -> None:
+        self._server = server
+        self.reservation_id = reservation_id
+        self.operation_id = operation_id
+        self.user_id = user_id
+        self.permission = permission
+        self.owner_key = owner_key
+        self.leases = leases
+        self.memo_ids = tuple(str(lease["memoId"]) for lease in leases)
+        self.delegated = delegated
+        self._state_lock = Lock()
+        self._valid_until = monotonic() + max(SYNC_LOCK_TTL_SECONDS * 0.75, 0.05)
+        self._valid = True
+        self._released = False
+        self._renewal_task: asyncio.Task | None = None
+
+    def start(self) -> None:
+        self._renewal_task = asyncio.create_task(
+            self._renew_loop(),
+            name=f"task-rollup-reservation:{self.reservation_id}",
+        )
+
+    def invalidate(self) -> None:
+        with self._state_lock:
+            self._valid = False
+
+    def _mark_renewed(self) -> None:
+        with self._state_lock:
+            if not self._released:
+                self._valid = True
+                self._valid_until = monotonic() + max(
+                    SYNC_LOCK_TTL_SECONDS * 0.75, 0.05
+                )
+
+    def _locally_valid(self) -> bool:
+        with self._state_lock:
+            return (
+                self._valid
+                and not self._released
+                and self._valid_until > monotonic()
+            )
+
+    def validate(self) -> bool:
+        """Synchronous canonical final fence for SQL worker threads."""
+        if not self.validate_local():
+            return False
+        if self.delegated:
+            return self._server._validate_task_rollup_reservation(self)
+        return True
+
+    def validate_local(self) -> bool:
+        """Fast post-statement fence; delegated callers still need final validate()."""
+        if not self._locally_valid():
+            return False
+        if self.delegated:
+            return True
+        return self._server.lock_registry.validate_batch(
+            reservation_id=self.reservation_id,
+            operation_id=self.operation_id,
+            owner_key=self.owner_key,
+            user_id=self.user_id,
+            leases=self.leases,
+        )
+
+    async def _renew_loop(self) -> None:
+        interval = max(SYNC_LOCK_TTL_SECONDS / 3, 0.05)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                if not self._locally_valid():
+                    self.invalidate()
+                    return
+                await self._server._renew_task_rollup_reservation(self)
+                self._mark_renewed()
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001 - any lost renewal invalidates the SQL fence
+            self.invalidate()
+            logger.exception(
+                "task rollup reservation renewal failed: reservation=%s",
+                self.reservation_id,
+            )
+
+    async def release(self) -> None:
+        """Idempotently release the reservation, never the editor leases."""
+        with self._state_lock:
+            if self._released:
+                return
+            self._released = True
+            self._valid = False
+        renewal_task = self._renewal_task
+        if renewal_task is not None and renewal_task is not asyncio.current_task():
+            renewal_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await renewal_task
+        try:
+            await self._server._release_task_rollup_reservation(self)
+        except Exception:  # noqa: BLE001 - canonical TTL is the crash-safe cleanup
+            logger.exception(
+                "task rollup reservation release deferred to TTL: reservation=%s",
+                self.reservation_id,
+            )
+        finally:
+            self._server._task_rollup_reservations.pop(self.reservation_id, None)
+
+    async def __aenter__(self) -> "TaskRollupReservation":
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback) -> None:  # noqa: ANN001
+        await self.release()
+
 
 def sync_room(account_id: str) -> str:
     return f"{SYNC_ROOM_PREFIX}{account_id}"
@@ -80,7 +232,9 @@ class MemoRealtimeServer:
         self.users: dict[str, dict] = {}
         self.socket_memos: dict[str, set[str]] = defaultdict(set)
         self.socket_locks: dict[str, set[str]] = defaultdict(set)
-        self.socket_lease_tokens: dict[str, dict[str, tuple[str, float]]] = defaultdict(dict)
+        self.socket_lease_tokens: dict[
+            str, dict[str, tuple[str, float] | tuple[str, float, int | None]]
+        ] = defaultdict(dict)
         self.screen_shares: dict[str, dict] = {}
         self.socket_projects: dict[str, set[str]] = defaultdict(set)
         self.socket_sessions: dict[str, str] = {}
@@ -94,6 +248,7 @@ class MemoRealtimeServer:
         self.lock_registry = get_lock_registry()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._lock_delegation_quarantine_until = 0.0
+        self._task_rollup_reservations: dict[str, TaskRollupReservation] = {}
         self.available = socketio is not None
         self.session_service.on_session_invalidated(self._on_session_invalidated)
 
@@ -254,23 +409,471 @@ class MemoRealtimeServer:
             raise LockDelegationError("sync peer is not configured")
         try:
             result = await asyncio.to_thread(call, *args)
-            self._lock_delegation_quarantine_until = 0.0
             return result
         except SyncPeerUnreachable as exc:
             runtime.mark_offline(f"lock delegation failed: {exc}")
-            self._lock_delegation_quarantine_until = (
-                monotonic() + SYNC_LOCK_TTL_SECONDS
+            self._lock_delegation_quarantine_until = max(
+                getattr(self, "_lock_delegation_quarantine_until", 0.0),
+                monotonic() + SYNC_LOCK_TTL_SECONDS,
             )
             raise LockDelegationError("sync peer is unreachable") from exc
         except SyncPeerError as exc:
             logger.warning("remote lock delegation rejected: %s", exc)
-            raise LockDelegationError("sync peer rejected the lock request") from exc
+            raise LockDelegationError(
+                "sync peer rejected the lock request", _peer_error_code(exc)
+            ) from exc
 
     async def _resolve_lock_holder(self, memo_id: str) -> dict | None:
         delegated = await self._delegate_lock(get_sync_peer().lock_holder, memo_id)
         if delegated is not None:
             return delegated.get("holder")
         return self.lock_registry.holder(memo_id)
+
+    def _rollup_reservations(self) -> dict[str, TaskRollupReservation]:
+        reservations = getattr(self, "_task_rollup_reservations", None)
+        if reservations is None:
+            reservations = {}
+            self._task_rollup_reservations = reservations
+        return reservations
+
+    @staticmethod
+    def _normalize_task_rollup_leases(leases) -> tuple[dict, ...]:  # noqa: ANN001
+        normalized: list[dict] = []
+        for lease in leases or []:
+            if hasattr(lease, "model_dump"):
+                raw = lease.model_dump()
+            elif isinstance(lease, dict):
+                raw = lease
+            else:
+                raw = {
+                    "memoId": getattr(lease, "memoId", None)
+                    or getattr(lease, "memo_id", None),
+                    "leaseToken": getattr(lease, "token", None)
+                    or getattr(lease, "leaseToken", None)
+                    or getattr(lease, "lease_token", None),
+                }
+            memo_id = str(raw.get("memoId") or raw.get("memo_id") or "").strip()
+            lease_token = str(
+                raw.get("token")
+                or raw.get("leaseToken")
+                or raw.get("lease_token")
+                or ""
+            ).strip()
+            if not memo_id or not lease_token:
+                raise TaskRollupReservationError(
+                    "invalid_lease_manifest",
+                    "every lease needs a memo id and token",
+                )
+            normalized.append({"memoId": memo_id, "leaseToken": lease_token})
+        normalized.sort(key=lambda item: item["memoId"])
+        if not normalized:
+            raise TaskRollupReservationError(
+                "empty_lease_manifest", "at least one lease is required"
+            )
+        memo_ids = [item["memoId"] for item in normalized]
+        if len(set(memo_ids)) != len(memo_ids):
+            raise TaskRollupReservationError(
+                "duplicate_memo_lease", "a memo may appear only once"
+            )
+        return tuple(normalized)
+
+    def _reservation_owner_sid(
+        self, user_id: str, leases: tuple[dict, ...]
+    ) -> str:
+        candidates = {
+            sid
+            for sid, user_info in self.users.items()
+            if user_info.get("user_id") == user_id
+        }
+        for lease in leases:
+            memo_id = lease["memoId"]
+            token = lease["leaseToken"]
+            candidates = {
+                sid
+                for sid in candidates
+                if memo_id in self.socket_memos.get(sid, set())
+                and memo_id in self.socket_locks.get(sid, set())
+                and (entry := self._lease_tokens_for(sid).get(memo_id)) is not None
+                and entry[0] == token
+                and entry[1] > monotonic()
+                and self.socket_owns_valid_lease(sid, memo_id)
+            }
+            if not candidates:
+                break
+        if len(candidates) != 1:
+            raise TaskRollupReservationError(
+                "lease_owner_mismatch",
+                "all leases must be owned by one authenticated editor socket",
+            )
+        return next(iter(candidates))
+
+    @staticmethod
+    def _validated_reservation_leases(
+        payload: dict,
+        *,
+        reservation_id: str,
+        operation_id: str,
+        user_id: str,
+        owner_key: str,
+        claims: tuple[dict, ...],
+        delegated: bool,
+    ) -> tuple[dict, ...]:
+        reservation = payload.get("reservation", payload)
+        if not isinstance(reservation, dict):
+            raise TaskRollupReservationError(
+                "invalid_reservation_response", "lock service returned an invalid response"
+            )
+        expected_owner = f"peer:{owner_key}" if delegated else owner_key
+        returned = reservation.get("leases")
+        if (
+            reservation.get("reservationId") != reservation_id
+            or reservation.get("operationId") != operation_id
+            or reservation.get("userId") != user_id
+            or reservation.get("ownerKey") != expected_owner
+            or not isinstance(returned, list)
+        ):
+            raise TaskRollupReservationError(
+                "reservation_identity_mismatch",
+                "lock service changed the reservation identity",
+            )
+        expected = [(item["memoId"], item["leaseToken"]) for item in claims]
+        fenced: list[dict] = []
+        for item in returned:
+            try:
+                generation = int(item["generation"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise TaskRollupReservationError(
+                    "invalid_reservation_response",
+                    "lock service omitted a lease generation",
+                ) from exc
+            fenced.append(
+                {
+                    "memoId": str(item.get("memoId") or ""),
+                    "leaseToken": str(item.get("leaseToken") or ""),
+                    "generation": generation,
+                }
+            )
+        fenced.sort(key=lambda item: item["memoId"])
+        actual = [(item["memoId"], item["leaseToken"]) for item in fenced]
+        expected_generations = {
+            item["memoId"]: item.get("generation") for item in claims
+        }
+        if (
+            actual != expected
+            or any(item["generation"] < 1 for item in fenced)
+            or any(
+                expected_generations[item["memoId"]] is not None
+                and item["generation"] != expected_generations[item["memoId"]]
+                for item in fenced
+            )
+        ):
+            raise TaskRollupReservationError(
+                "reservation_fence_mismatch",
+                "lock service did not reserve the exact lease set",
+            )
+        return tuple(fenced)
+
+    async def _call_canonical_reservation(self, call, *args) -> dict:
+        """Call an existing remote reservation without ever falling back locally."""
+        peer = get_sync_peer()
+        if not peer.configured:
+            raise LockDelegationError("sync peer is not configured")
+        try:
+            result = await asyncio.to_thread(call, *args)
+            return result
+        except SyncPeerUnreachable as exc:
+            get_sync_runtime().mark_offline(
+                f"lock reservation delegation failed: {exc}"
+            )
+            self._lock_delegation_quarantine_until = max(
+                getattr(self, "_lock_delegation_quarantine_until", 0.0),
+                monotonic() + SYNC_LOCK_TTL_SECONDS,
+            )
+            raise LockDelegationError(
+                "remote reservation outcome is uncertain"
+            ) from exc
+        except SyncPeerError as exc:
+            raise LockDelegationError(
+                "sync peer rejected the reservation request", _peer_error_code(exc)
+            ) from exc
+
+    async def _cleanup_uncertain_remote_reservation(
+        self,
+        *,
+        reservation_id: str,
+        operation_id: str,
+        owner_key: str,
+        user_id: str,
+    ) -> None:
+        """Best-effort exact cleanup after a successful but malformed reserve reply."""
+        quarantine_until = monotonic() + SYNC_LOCK_TTL_SECONDS
+        self._lock_delegation_quarantine_until = max(
+            getattr(self, "_lock_delegation_quarantine_until", 0.0),
+            quarantine_until,
+        )
+        try:
+            result = await self._call_canonical_reservation(
+                get_sync_peer().lock_reservation_release,
+                reservation_id,
+                operation_id,
+                owner_key,
+                user_id,
+            )
+        except LockDelegationError:
+            self._lock_delegation_quarantine_until = max(
+                getattr(self, "_lock_delegation_quarantine_until", 0.0),
+                quarantine_until,
+            )
+            return
+        if not bool(result.get("released")):
+            self._lock_delegation_quarantine_until = max(
+                getattr(self, "_lock_delegation_quarantine_until", 0.0),
+                quarantine_until,
+            )
+
+    async def reserve_task_rollup(
+        self, user_id: str, operation_id: str, leases
+    ) -> TaskRollupReservation:  # noqa: ANN001
+        """Reserve an exact already-owned lease set without acquiring any lease."""
+        if not self.available:
+            raise TaskRollupReservationError(
+                "memo_realtime_unavailable", "realtime lease service is unavailable"
+            )
+        try:
+            UUID(str(operation_id))
+        except (TypeError, ValueError) as exc:
+            raise TaskRollupReservationError(
+                "invalid_operation_id", "operation id must be a UUID"
+            ) from exc
+        claims = self._normalize_task_rollup_leases(leases)
+        sid = self._reservation_owner_sid(str(user_id), claims)
+        claims = tuple(
+            {
+                **claim,
+                "generation": (
+                    entry[2]
+                    if len(entry := self._lease_tokens_for(sid)[claim["memoId"]]) > 2
+                    else None
+                ),
+            }
+            for claim in claims
+        )
+        wire_claims = [
+            {"memoId": claim["memoId"], "leaseToken": claim["leaseToken"]}
+            for claim in claims
+        ]
+        owner_key = self._owner_key(sid)
+        reservation_id = str(uuid4())
+        try:
+            delegated_result = await self._delegate_lock(
+                get_sync_peer().lock_reservation_reserve,
+                reservation_id,
+                str(operation_id),
+                owner_key,
+                str(user_id),
+                wire_claims,
+            )
+            delegated = delegated_result is not None
+            if delegated:
+                result = delegated_result
+            else:
+                result = self.lock_registry.reserve_batch(
+                    reservation_id=reservation_id,
+                    operation_id=str(operation_id),
+                    owner_key=owner_key,
+                    user_id=str(user_id),
+                    leases=wire_claims,
+                )
+        except ReservationConflict as exc:
+            raise TaskRollupReservationError(exc.code, str(exc)) from exc
+        except LockDelegationError as exc:
+            raise TaskRollupReservationError(
+                (
+                    "reservation_delegation_unavailable"
+                    if exc.code == "delegation_unavailable"
+                    else exc.code
+                ),
+                str(exc),
+            ) from exc
+        try:
+            fenced = self._validated_reservation_leases(
+                result,
+                reservation_id=reservation_id,
+                operation_id=str(operation_id),
+                user_id=str(user_id),
+                owner_key=owner_key,
+                claims=claims,
+                delegated=delegated,
+            )
+        except TaskRollupReservationError:
+            if delegated:
+                await self._cleanup_uncertain_remote_reservation(
+                    reservation_id=reservation_id,
+                    operation_id=str(operation_id),
+                    owner_key=owner_key,
+                    user_id=str(user_id),
+                )
+            else:
+                self.lock_registry.release_batch(
+                    reservation_id=reservation_id,
+                    operation_id=str(operation_id),
+                    owner_key=owner_key,
+                    user_id=str(user_id),
+                )
+            raise
+        handle = TaskRollupReservation(
+            self,
+            reservation_id=reservation_id,
+            operation_id=str(operation_id),
+            user_id=str(user_id),
+            permission=str(self.users[sid].get("permission") or "user"),
+            owner_key=owner_key,
+            leases=fenced,
+            delegated=delegated,
+        )
+        self._rollup_reservations()[reservation_id] = handle
+        handle.start()
+        return handle
+
+    async def _renew_task_rollup_reservation(
+        self, reservation: TaskRollupReservation
+    ) -> None:
+        claims = [
+            {"memoId": lease["memoId"], "leaseToken": lease["leaseToken"]}
+            for lease in reservation.leases
+        ]
+        if reservation.delegated:
+            result = await self._call_canonical_reservation(
+                get_sync_peer().lock_reservation_renew,
+                reservation.reservation_id,
+                reservation.operation_id,
+                reservation.owner_key,
+                reservation.user_id,
+                claims,
+            )
+            fenced = self._validated_reservation_leases(
+                result,
+                reservation_id=reservation.reservation_id,
+                operation_id=reservation.operation_id,
+                user_id=reservation.user_id,
+                owner_key=reservation.owner_key,
+                claims=tuple(claims),
+                delegated=True,
+            )
+            if fenced != reservation.leases:
+                raise TaskRollupReservationError(
+                    "reservation_fence_mismatch", "lease generation changed"
+                )
+            return
+
+        user_info = {
+            "user_id": reservation.user_id,
+            "permission": reservation.permission,
+        }
+        access = await asyncio.gather(
+            *(
+                asyncio.to_thread(self._can_access_memo, memo_id, user_info, True)
+                for memo_id in reservation.memo_ids
+            )
+        )
+        if not all(access):
+            self.lock_registry.revoke_batch(
+                reservation_id=reservation.reservation_id,
+                operation_id=reservation.operation_id,
+                owner_key=reservation.owner_key,
+                user_id=reservation.user_id,
+            )
+            raise TaskRollupReservationError(
+                "reservation_access_revoked", "memo write access was revoked"
+            )
+        try:
+            renewed = self.lock_registry.renew_batch(
+                reservation_id=reservation.reservation_id,
+                operation_id=reservation.operation_id,
+                owner_key=reservation.owner_key,
+                user_id=reservation.user_id,
+                leases=claims,
+            )
+        except ReservationConflict as exc:
+            raise TaskRollupReservationError(exc.code, str(exc)) from exc
+        fenced = self._validated_reservation_leases(
+            renewed,
+            reservation_id=reservation.reservation_id,
+            operation_id=reservation.operation_id,
+            user_id=reservation.user_id,
+            owner_key=reservation.owner_key,
+            claims=tuple(claims),
+            delegated=False,
+        )
+        if fenced != reservation.leases:
+            raise TaskRollupReservationError(
+                "reservation_fence_mismatch", "lease generation changed"
+            )
+
+    async def _release_task_rollup_reservation(
+        self, reservation: TaskRollupReservation
+    ) -> None:
+        if reservation.delegated:
+            await self._call_canonical_reservation(
+                get_sync_peer().lock_reservation_release,
+                reservation.reservation_id,
+                reservation.operation_id,
+                reservation.owner_key,
+                reservation.user_id,
+            )
+            return
+        self.lock_registry.release_batch(
+            reservation_id=reservation.reservation_id,
+            operation_id=reservation.operation_id,
+            owner_key=reservation.owner_key,
+            user_id=reservation.user_id,
+        )
+
+    def _validate_task_rollup_reservation(
+        self, reservation: TaskRollupReservation
+    ) -> bool:
+        """Worker-thread remote fence check; unknown outcomes always fail closed."""
+        claims = [dict(lease) for lease in reservation.leases]
+        peer = get_sync_peer()
+        if not peer.configured:
+            reservation.invalidate()
+            return False
+        try:
+            result = peer.lock_reservation_validate(
+                reservation.reservation_id,
+                reservation.operation_id,
+                reservation.owner_key,
+                reservation.user_id,
+                claims,
+            )
+        except SyncPeerUnreachable as exc:
+            get_sync_runtime().mark_offline(
+                f"lock reservation validation failed: {exc}"
+            )
+            self._lock_delegation_quarantine_until = max(
+                getattr(self, "_lock_delegation_quarantine_until", 0.0),
+                monotonic() + SYNC_LOCK_TTL_SECONDS,
+            )
+            reservation.invalidate()
+            return False
+        except SyncPeerError:
+            reservation.invalidate()
+            return False
+        except Exception:  # noqa: BLE001 - final SQL fence must fail closed
+            self._lock_delegation_quarantine_until = max(
+                getattr(self, "_lock_delegation_quarantine_until", 0.0),
+                monotonic() + SYNC_LOCK_TTL_SECONDS,
+            )
+            reservation.invalidate()
+            logger.exception(
+                "task rollup canonical validation failed: reservation=%s",
+                reservation.reservation_id,
+            )
+            return False
+        valid = bool(result.get("valid"))
+        if not valid:
+            reservation.invalidate()
+        return valid
 
     # -- 핸들러 -------------------------------------------------------------
 
@@ -488,6 +1091,11 @@ class MemoRealtimeServer:
         self._lease_tokens_for(sid)[memo_id] = (
             lease_token,
             monotonic() + max(SYNC_LOCK_TTL_SECONDS * 0.75, 1),
+            (
+                int(holder["generation"])
+                if holder.get("generation") is not None
+                else None
+            ),
         )
         renew_after_ms = max(int(SYNC_LOCK_TTL_SECONDS * 1000 / 3), 1000)
         if renewal:
@@ -725,6 +1333,11 @@ class MemoRealtimeServer:
                     if disconnect:
                         await self._disconnect_browser_socket(sid)
                         break
+        # Delegated peer owners are not members of local memo rooms. Recheck
+        # canonical registry holders as well so a role tombstone immediately
+        # tears down the exact reservation fence instead of waiting for TTL.
+        for memo_id in list(self.lock_registry.snapshot()):
+            await self._force_release_revoked_registry_lock(memo_id)
 
     async def revalidate_memo_access(self, memo_id: str) -> None:
         """메모 이동 직후 대상 프로젝트 권한이 없는 구독/lease를 즉시 제거한다."""
@@ -749,6 +1362,41 @@ class MemoRealtimeServer:
             finally:
                 if disconnect:
                     await self._disconnect_browser_socket(sid)
+        await self._force_release_revoked_registry_lock(memo_id)
+
+    async def _force_release_revoked_registry_lock(self, memo_id: str) -> None:
+        holder = self.lock_registry.holder(memo_id)
+        if holder is None:
+            return
+        user_id = str(holder.get("userId") or "")
+        if not user_id:
+            self.lock_registry.release(memo_id, force=True)
+            return
+        permission = "user"
+        owner_key = str(holder.get("ownerKey") or "")
+        for reservation in self._rollup_reservations().values():
+            if (
+                reservation.owner_key in {owner_key, owner_key.removeprefix("peer:")}
+                and memo_id in reservation.memo_ids
+            ):
+                permission = reservation.permission
+                break
+        if permission == "user":
+            local_prefix = f"{SYNC_CLIENT_ID}:"
+            local_owner = owner_key.removeprefix("peer:")
+            if local_owner.startswith(local_prefix):
+                sid = local_owner[len(local_prefix) :]
+                permission = str(
+                    (self.users.get(sid) or {}).get("permission") or "user"
+                )
+        can_write = await asyncio.to_thread(
+            self._can_access_memo,
+            memo_id,
+            {"user_id": user_id, "permission": permission},
+            True,
+        )
+        if not can_write:
+            self.lock_registry.release(memo_id, owner_key, force=True)
 
     async def emit_projects_changed(self) -> None:
         """프로젝트/멤버/메모 배치 변경을 인증된 브라우저에 내용 없이 알린다."""
@@ -917,6 +1565,7 @@ class MemoRealtimeServer:
         )
 
     async def emit_lock_state(self, memo_id: str, holder: dict | None) -> None:
+        self._invalidate_changed_task_rollup_fences(memo_id, holder)
         if not self.available:
             return
         if holder is None:
@@ -947,6 +1596,32 @@ class MemoRealtimeServer:
             room=f"memo:{memo_id}",
             skip_sid=owner_sid,
         )
+
+    def _invalidate_changed_task_rollup_fences(
+        self, memo_id: str, holder: dict | None
+    ) -> None:
+        for reservation in list(self._rollup_reservations().values()):
+            lease = next(
+                (
+                    item
+                    for item in reservation.leases
+                    if item["memoId"] == memo_id
+                ),
+                None,
+            )
+            if lease is None:
+                continue
+            expected_owners = {
+                reservation.owner_key,
+                f"peer:{reservation.owner_key}",
+            }
+            if (
+                holder is None
+                or holder.get("ownerKey") not in expected_owners
+                or holder.get("leaseToken") != lease["leaseToken"]
+                or holder.get("generation") != lease["generation"]
+            ):
+                reservation.invalidate()
 
     def _can_access_memo(
         self, memo_id: str, user_info: dict, require_write: bool
@@ -987,7 +1662,9 @@ class MemoRealtimeServer:
             logger.exception("project socket authorization failed")
             return False
 
-    def _lease_tokens_for(self, sid: str) -> dict[str, tuple[str, float]]:
+    def _lease_tokens_for(
+        self, sid: str
+    ) -> dict[str, tuple[str, float] | tuple[str, float, int | None]]:
         tokens = getattr(self, "socket_lease_tokens", None)
         if tokens is None:
             tokens = defaultdict(dict)

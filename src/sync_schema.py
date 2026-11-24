@@ -18,7 +18,8 @@ import unicodedata
 #   2 — updated_at_utc / tombstone / memo_versions.note / change_log 도입
 #   3 — project hierarchy/group + memo kind(backlog) 도입
 #   4 — account-private backlog semantics + attachment metadata 도입
-SCHEMA_VERSION = 4
+#   5 — account-private durable task-rollup completion receipts
+SCHEMA_VERSION = 5
 
 # FK 의존성 순서 — push 적용은 반드시 이 순서를 따른다.
 # (오프라인에서 "프로젝트 생성 → 그 안에 메모 생성" 이 흔하다.)
@@ -28,6 +29,7 @@ SYNC_TABLE_ORDER: tuple[str, ...] = (
     "memo_versions",
     "memo_attachments",
     "project_members",
+    "task_rollup_completions",
 )
 
 SYNC_TABLES: dict[str, dict] = {
@@ -133,6 +135,28 @@ SYNC_TABLES: dict[str, dict] = {
         "duplicate_column": None,
         "duplicate_kind": None,
     },
+    "task_rollup_completions": {
+        "pk": "id",
+        "columns": (
+            "id",
+            "project_id",
+            "actor_id",
+            "group_key",
+            "payload_hash",
+            "data_json",
+            "completed_at_utc",
+            "completion_date_kst",
+            "undo_operation_id",
+            "undo_payload_hash",
+            "undo_data_json",
+            "updated_at_utc",
+            "deleted_at",
+        ),
+        "parents": (("project_id", "projects"),),
+        "duplicate_scope": None,
+        "duplicate_column": None,
+        "duplicate_kind": None,
+    },
 }
 
 # tombstone 을 가지는 테이블 (soft delete 대상)
@@ -146,8 +170,11 @@ CLOCK_COLUMN = "updated_at_utc"
 # 와이어 직렬화 규칙.
 #   UTC_COLUMNS        — naive UTC 저장 → `...Z` ISO 문자열
 #   WALL_CLOCK_COLUMNS — 표시 전용 naive 벽시계(Asia/Seoul) → 오프셋 없는 ISO 문자열로 그대로 전달
-UTC_COLUMNS: frozenset[str] = frozenset({"updated_at_utc", "deleted_at"})
+UTC_COLUMNS: frozenset[str] = frozenset(
+    {"completed_at_utc", "updated_at_utc", "deleted_at"}
+)
 WALL_CLOCK_COLUMNS: frozenset[str] = frozenset({"created_at", "updated_at", "invited_at"})
+DATE_COLUMNS: frozenset[str] = frozenset({"completion_date_kst"})
 
 # 메모 본문처럼 "패자를 버전으로 보존해야 하는" 컬럼
 CONTENT_COLUMN_BY_TABLE = {"memos": "content"}

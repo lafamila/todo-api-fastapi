@@ -1,8 +1,8 @@
 import asyncio
-import hashlib
-import json
+from contextlib import contextmanager
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from pymysql.err import OperationalError
 
 try:
     from ..auth_utils import get_current_user, require_admin
@@ -16,6 +16,7 @@ try:
     )
     from ..services.merge import MergeError, run_merge
     from ..services.memo_search import search_memos, validate_search_query
+    from ..services.memo_revision import memo_revision
     from ..services.realtime import get_realtime_server
     from ..timeutil import iso_utc, localnow_naive, utcnow_naive
     from ..utils import (
@@ -39,6 +40,7 @@ except ImportError:  # pragma: no cover
     )
     from services.merge import MergeError, run_merge
     from services.memo_search import search_memos, validate_search_query
+    from services.memo_revision import memo_revision
     from services.realtime import get_realtime_server
     from timeutil import iso_utc, localnow_naive, utcnow_naive
     from utils import (
@@ -74,17 +76,7 @@ MEMO_COLUMNS = (
 
 def _memo_revision(memo: dict) -> str:
     """Return an opaque, deterministic revision without adding DB state."""
-    canonical = json.dumps(
-        {
-            "content": memo["content"],
-            "id": memo["id"],
-            "updatedAtUtc": iso_utc(memo.get("updated_at_utc")),
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return memo_revision(memo)
 
 
 def _serialize_memo(memo: dict) -> dict:
@@ -411,13 +403,30 @@ async def create_project_backlog(project_id: str, user: dict = Depends(get_curre
             })
 
 
+@contextmanager
+def _memo_move_transaction():
+    """이동 직렬화 충돌은 전체 rollback 후에만 HTTP 충돌로 반환한다."""
+    try:
+        with get_db_connection() as conn:
+            yield conn
+    except OperationalError as exc:
+        # MariaDB snapshot isolation can reject a locking read even after the
+        # ordered project locks serialize two moves. Do not retry a partial move.
+        if not exc.args or exc.args[0] not in {1020, 1205, 1213}:
+            raise
+        raise HTTPException(
+            status_code=409,
+            detail="Memo move conflicted with another transaction; retry the move",
+        ) from exc
+
+
 @router.post("/memos/{memo_id}/move")
 async def move_memo(
     memo_id: str, data: MoveMemoRequest, user: dict = Depends(get_current_user)
 ):
     """root creator가 같은 그룹의 형제 subproject 사이에서 일반 메모를 이동한다."""
     now_utc = utcnow_naive()
-    with get_db_connection() as conn:
+    with _memo_move_transaction() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
                 "SELECT id, project_id, kind, title FROM memos WHERE id = %s AND deleted_at IS NULL",
@@ -489,7 +498,7 @@ async def bulk_move_memos(
         raise HTTPException(status_code=422, detail="Source and target projects must differ")
 
     now_utc = utcnow_naive()
-    with get_db_connection() as conn:
+    with _memo_move_transaction() as conn:
         with conn.cursor() as cursor:
             source, target = _lock_owned_move_projects(
                 cursor, data.sourceProjectId, data.targetProjectId, user["id"]

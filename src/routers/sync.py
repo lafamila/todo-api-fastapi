@@ -51,7 +51,7 @@ try:
     )
     from ..timeutil import iso_utc, utcnow_naive
     from ..utils import require_memo_access
-    from ..services.lock_registry import get_lock_registry
+    from ..services.lock_registry import ReservationConflict, get_lock_registry
     from ..services.merge import MergeError, merge_memos, merge_projects
     from ..services.realtime import get_realtime_server
     from ..services.sync_apply import (
@@ -82,6 +82,10 @@ try:
         set_paused,
         visible_project_ids,
     )
+    from ..services.task_rollup_schema import (
+        TaskRollupSchemaError,
+        validate_task_rollup_sync_row,
+    )
 except ImportError:  # pragma: no cover
     from auth_utils import get_current_user, require_admin
     from config import (
@@ -103,7 +107,7 @@ except ImportError:  # pragma: no cover
     )
     from timeutil import iso_utc, utcnow_naive
     from utils import require_memo_access
-    from services.lock_registry import get_lock_registry
+    from services.lock_registry import ReservationConflict, get_lock_registry
     from services.merge import MergeError, merge_memos, merge_projects
     from services.realtime import get_realtime_server
     from services.sync_apply import (
@@ -134,11 +138,19 @@ except ImportError:  # pragma: no cover
         set_paused,
         visible_project_ids,
     )
+    from services.task_rollup_schema import (
+        TaskRollupSchemaError,
+        validate_task_rollup_sync_row,
+    )
 
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/sync", tags=["sync"])
+UUID_PATTERN = (
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
+    r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +198,54 @@ class LockAcquireRequest(BaseModel):
 
 class LockReleaseRequest(BaseModel):
     ownerKey: str
+
+
+class LockReservationLease(BaseModel):
+    memoId: str = Field(min_length=1, max_length=50)
+    leaseToken: str = Field(min_length=1, max_length=256)
+
+
+class LockReservationRequest(BaseModel):
+    reservationId: str = Field(
+        min_length=36,
+        max_length=36,
+        pattern=UUID_PATTERN,
+    )
+    operationId: str = Field(
+        min_length=36,
+        max_length=36,
+        pattern=UUID_PATTERN,
+    )
+    ownerKey: str = Field(min_length=1, max_length=256)
+    userId: str = Field(min_length=1, max_length=50)
+    leases: list[LockReservationLease] = Field(min_length=1, max_length=256)
+
+
+class LockReservationReleaseRequest(BaseModel):
+    reservationId: str = Field(
+        min_length=36, max_length=36, pattern=UUID_PATTERN
+    )
+    operationId: str = Field(
+        min_length=36, max_length=36, pattern=UUID_PATTERN
+    )
+    ownerKey: str = Field(min_length=1, max_length=256)
+    userId: str = Field(min_length=1, max_length=50)
+
+
+class LockReservationFenceLease(LockReservationLease):
+    generation: int = Field(ge=1)
+
+
+class LockReservationValidateRequest(BaseModel):
+    reservationId: str = Field(
+        min_length=36, max_length=36, pattern=UUID_PATTERN
+    )
+    operationId: str = Field(
+        min_length=36, max_length=36, pattern=UUID_PATTERN
+    )
+    ownerKey: str = Field(min_length=1, max_length=256)
+    userId: str = Field(min_length=1, max_length=50)
+    leases: list[LockReservationFenceLease] = Field(min_length=1, max_length=256)
 
 
 class ResolveIssuesRequest(BaseModel):
@@ -255,9 +315,16 @@ def _resolve_push_columns(body: SyncPushRequest) -> dict[str, tuple[str, ...]]:
     """push 스키마를 적용 **전에** 검증하고 명시적 drift 협상만 허용한다."""
     if body.schemaVersion == SCHEMA_VERSION:
         return {}
+    # One common gate serves push/pull/bootstrap. Emit no body/credential data.
+    try:
+        from ..services.task_rollup_observability import emit_rollup_event
+    except ImportError:  # pragma: no cover
+        from services.task_rollup_observability import emit_rollup_event
+    emit_rollup_event("sync", "schema_mismatch", stage="sync", cause="incompatible_schema", status=409, alert=True)
     # v4의 private backlog ownership/attachment metadata는 권한 경계다. 구버전
-    # 교집합 적용은 다른 계정의 backlog를 공유 memo처럼 노출하므로 허용하지 않는다.
-    if body.schemaVersion < 4:
+    # 교집합 적용은 다른 계정의 backlog를 공유 memo처럼 노출한다. v5의 private
+    # rollup receipt도 같은 fail-closed 업그레이드 경계를 공유한다.
+    if body.schemaVersion < 5:
         raise HTTPException(
             status_code=409,
             detail={
@@ -329,7 +396,7 @@ def _project_role(cursor, project_id: str, account_id: str) -> str | None:
 def _existing_project_id(cursor, table: str, row_id: str) -> str | None:
     if table == "projects":
         cursor.execute("SELECT id FROM projects WHERE id = %s", (row_id,))
-    elif table in ("memos", "project_members"):
+    elif table in ("memos", "project_members", "task_rollup_completions"):
         cursor.execute(f"SELECT project_id FROM `{table}` WHERE id = %s", (row_id,))
     elif table == "memo_versions":
         cursor.execute(
@@ -497,14 +564,46 @@ def _authorize_sync_changes(
         if table not in SYNC_TABLES:
             continue
         allowed = (columns_by_table or {}).get(table)
+        if table == "task_rollup_completions":
+            raw_fields = set(change.get("row") or {})
+            accepted_fields = set(allowed or SYNC_TABLES[table]["columns"])
+            unknown_fields = sorted(raw_fields - accepted_fields)
+            if unknown_fields:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "task_rollup_unknown_fields",
+                        "fields": unknown_fields,
+                    },
+                )
+            if change.get("op") == "delete":
+                raise _forbidden_change(
+                    table,
+                    str(change.get("rowId") or ""),
+                    "task_rollup_hard_delete_forbidden",
+                )
         row = filter_row(table, change.get("row") or {}, allowed)
         row_id = str(change.get("rowId") or "")
         cursor.execute(
             f"SELECT * FROM `{table}` WHERE {SYNC_TABLES[table]['pk']} = %s",
             (row_id,),
         )
+        existing = cursor.fetchone()
+        if table == "task_rollup_completions":
+            try:
+                row = validate_task_rollup_sync_row(
+                    cursor,
+                    row_id,
+                    row,
+                    existing,
+                    expected_actor_id=account_id,
+                )
+            except TaskRollupSchemaError as exc:
+                raise _forbidden_change(table, row_id, str(exc)) from exc
+            normalized.append((change, row))
+            continue
         row, deferred_reason, rejected_reason = normalize_hierarchy_row(
-            cursor, table, row_id, row, cursor.fetchone()
+            cursor, table, row_id, row, existing
         )
         paired_group_transition = rejected_reason == "group_transition_requires_child" and any(
             candidate.get("parent_id") == row_id
@@ -602,6 +701,9 @@ def _authorize_sync_changes(
         if not row_id:
             raise _forbidden_change(table, row_id)
         existing_project = _existing_project_id(cursor, table, row_id)
+
+        if table == "task_rollup_completions":
+            continue
 
         if table == "projects":
             cursor.execute("SELECT * FROM projects WHERE id = %s", (row_id,))
@@ -875,6 +977,58 @@ def _require_memo_write_access(cursor, memo_id: str, account_id: str) -> None:
     )
 
 
+def _reservation_identity(
+    body: (
+        LockReservationRequest
+        | LockReservationReleaseRequest
+        | LockReservationValidateRequest
+    ),
+    principal: SyncPrincipal,
+) -> tuple[str, str, str, str]:
+    if body.userId != principal.account_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "lock_reservation_actor_mismatch",
+                "message": "reservation actor must match the authenticated account",
+            },
+        )
+    return (
+        body.reservationId,
+        body.operationId,
+        f"peer:{body.ownerKey}",
+        body.userId,
+    )
+
+
+def _reservation_conflict(exc: ReservationConflict) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={"code": exc.code, "message": str(exc)},
+    )
+
+
+def _authorize_reservation_leases(
+    body: LockReservationRequest | LockReservationValidateRequest,
+    principal: SyncPrincipal,
+) -> list[dict]:
+    leases = [lease.model_dump() for lease in body.leases]
+    memo_ids = [str(lease["memoId"]) for lease in leases]
+    if len(set(memo_ids)) != len(memo_ids):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "duplicate_memo_lease",
+                "message": "a memo may appear only once",
+            },
+        )
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            for memo_id in sorted(memo_ids):
+                _require_memo_write_access(cursor, memo_id, principal.account_id)
+    return leases
+
+
 def _handshake_identity(cursor, account_id: str) -> dict:
     """`link-identity` 가 사람에게 보여줄 원격 신원."""
     identity = get_local_identity(cursor, account_id)
@@ -947,13 +1101,128 @@ async def sync_handshake(principal: SyncPrincipal = Depends(require_sync_princip
             }
 
 
+@router.post("/locks/reservations/reserve")
+async def sync_lock_reservation_reserve(
+    body: LockReservationRequest,
+    principal: SyncPrincipal = Depends(require_sync_principal),
+):
+    reservation_id, operation_id, owner_key, user_id = _reservation_identity(
+        body, principal
+    )
+    leases = await asyncio.to_thread(
+        _authorize_reservation_leases, body, principal
+    )
+    try:
+        reservation = get_lock_registry().reserve_batch(
+            reservation_id=reservation_id,
+            operation_id=operation_id,
+            owner_key=owner_key,
+            user_id=user_id,
+            leases=leases,
+        )
+    except ReservationConflict as exc:
+        raise _reservation_conflict(exc) from exc
+    return {"reserved": True, "reservation": reservation}
+
+
+@router.post("/locks/reservations/renew")
+async def sync_lock_reservation_renew(
+    body: LockReservationRequest,
+    principal: SyncPrincipal = Depends(require_sync_principal),
+):
+    reservation_id, operation_id, owner_key, user_id = _reservation_identity(
+        body, principal
+    )
+    registry = get_lock_registry()
+    try:
+        leases = await asyncio.to_thread(
+            _authorize_reservation_leases, body, principal
+        )
+    except HTTPException:
+        # A live role revocation must invalidate the reservation and its exact
+        # fenced editor leases instead of waiting for a normal release call.
+        registry.revoke_batch(
+            reservation_id=reservation_id,
+            operation_id=operation_id,
+            owner_key=owner_key,
+            user_id=user_id,
+        )
+        raise
+    try:
+        reservation = registry.renew_batch(
+            reservation_id=reservation_id,
+            operation_id=operation_id,
+            owner_key=owner_key,
+            user_id=user_id,
+            leases=leases,
+        )
+    except ReservationConflict as exc:
+        raise _reservation_conflict(exc) from exc
+    return {"renewed": True, "reservation": reservation}
+
+
+@router.post("/locks/reservations/release")
+async def sync_lock_reservation_release(
+    body: LockReservationReleaseRequest,
+    principal: SyncPrincipal = Depends(require_sync_principal),
+):
+    reservation_id, operation_id, owner_key, user_id = _reservation_identity(
+        body, principal
+    )
+    released = get_lock_registry().release_batch(
+        reservation_id=reservation_id,
+        operation_id=operation_id,
+        owner_key=owner_key,
+        user_id=user_id,
+    )
+    return {"released": released}
+
+
+@router.post("/locks/reservations/validate")
+async def sync_lock_reservation_validate(
+    body: LockReservationValidateRequest,
+    principal: SyncPrincipal = Depends(require_sync_principal),
+):
+    reservation_id, operation_id, owner_key, user_id = _reservation_identity(
+        body, principal
+    )
+    registry = get_lock_registry()
+    try:
+        leases = await asyncio.to_thread(
+            _authorize_reservation_leases, body, principal
+        )
+    except HTTPException:
+        registry.revoke_batch(
+            reservation_id=reservation_id,
+            operation_id=operation_id,
+            owner_key=owner_key,
+            user_id=user_id,
+        )
+        raise
+    return {
+        "valid": registry.validate_batch(
+            reservation_id=reservation_id,
+            operation_id=operation_id,
+            owner_key=owner_key,
+            user_id=user_id,
+            leases=leases,
+        )
+    }
+
+
 @router.get("/changes")
 async def sync_changes(
     since: int = Query(0, ge=0),
     limit: int = Query(default=SYNC_BATCH_LIMIT, ge=1, le=2000),
+    schema_version: int | None = Query(
+        default=None,
+        alias="schemaVersion",
+        ge=1,
+    ),
     principal: SyncPrincipal = Depends(require_sync_principal),
 ):
     """`since` 이후 변경을 **그 계정이 볼 수 있는 행만** 반환한다."""
+    _require_pull_schema_version(schema_version)
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             changes, next_seq = read_changes(cursor, since, limit, principal.account_id)
@@ -964,6 +1233,39 @@ async def sync_changes(
                 "maxSeq": max_change_seq(cursor),
                 "serverTimeUtc": iso_utc(utcnow_naive()),
             }
+
+
+def _require_pull_schema_version(schema_version: int | None) -> None:
+    """Fail closed before reading a v5 feed for an undeclared/incompatible client."""
+    if type(schema_version) is int and schema_version == SCHEMA_VERSION:
+        return
+    try:
+        from ..services.task_rollup_observability import emit_rollup_event
+    except ImportError:  # pragma: no cover
+        from services.task_rollup_observability import emit_rollup_event
+    emit_rollup_event(
+        "sync",
+        "schema_mismatch",
+        stage="sync",
+        cause="incompatible_schema",
+        status=409,
+        alert=True,
+    )
+    client_version = schema_version if type(schema_version) is int else None
+    if client_version is None:
+        code = "sync_schema_version_required"
+    elif client_version < SCHEMA_VERSION:
+        code = "sync_private_media_schema_upgrade_required"
+    else:
+        code = "sync_client_schema_ahead"
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": code,
+            "serverSchemaVersion": SCHEMA_VERSION,
+            "clientSchemaVersion": client_version,
+        },
+    )
 
 
 @router.post("/push")
@@ -983,6 +1285,14 @@ async def sync_push(
         )
         unknown = sorted(set(change.row) - allowed)
         if unknown:
+            if change.table == "task_rollup_completions":
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "task_rollup_unknown_fields",
+                        "fields": unknown,
+                    },
+                )
             dropped.setdefault(change.table, [])
             dropped[change.table] = sorted(set(dropped[change.table]) | set(unknown))
 
@@ -1078,11 +1388,28 @@ async def sync_lock_acquire(
     principal: SyncPrincipal = Depends(require_sync_principal),
 ):
     """위임된 락 획득. 서버가 단일 진실이므로 노드를 넘어 단일 작성자가 보장된다."""
+    if body.userId != principal.account_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "lock_actor_mismatch",
+                "message": "lock actor must match the authenticated account",
+            },
+        )
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             _require_memo_write_access(cursor, memo_id, principal.account_id)
+            identity = _handshake_identity(cursor, principal.account_id)
+    display_name = str(
+        identity.get("displayName")
+        or identity.get("loginId")
+        or principal.account_id
+    )
     acquired, holder = get_lock_registry().acquire(
-        memo_id, f"peer:{body.ownerKey}", body.userId, body.displayName or body.userId
+        memo_id,
+        f"peer:{body.ownerKey}",
+        principal.account_id,
+        display_name,
     )
     return {"memoId": memo_id, "acquired": acquired, "holder": holder}
 
@@ -1217,7 +1544,7 @@ def _issue_project_ids(cursor, issue: dict) -> set[str]:
             f"SELECT id AS project_id FROM projects WHERE id IN ({placeholders})",
             params,
         )
-    elif table in ("memos", "project_members"):
+    elif table in ("memos", "project_members", "task_rollup_completions"):
         cursor.execute(
             f"SELECT DISTINCT project_id FROM `{table}` WHERE id IN ({placeholders})",
             params,

@@ -259,7 +259,7 @@ class SyncDaemon:
 
         account_id = str(handshake.get("accountId") or "")
         push_report = self._push_rounds(columns_by_table, account_id)
-        pull_report = self._pull_rounds(columns_by_table)
+        pull_report = self._pull_rounds(columns_by_table, account_id)
 
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
@@ -287,11 +287,11 @@ class SyncDaemon:
                 f"로컬 스키마가 앞서 있습니다 (로컬 {SCHEMA_VERSION} > 원격 {peer_version}). "
                 "원격 배포 후 재개하세요."
             )
-            if peer_version < 4 <= SCHEMA_VERSION:
+            if peer_version < 5 <= SCHEMA_VERSION:
                 raise SyncBlocked(
                     "schema",
                     message
-                    + " private backlog/attachment 스키마는 공통 필드 모드로 안전하게 축소할 수 없습니다.",
+                    + " private rollup/backlog/media 스키마는 공통 필드 모드로 안전하게 축소할 수 없습니다.",
                     {"local": SCHEMA_VERSION, "peer": peer_version},
                 )
             if not SYNC_ALLOW_SCHEMA_DRIFT:
@@ -583,7 +583,11 @@ class SyncDaemon:
                 detail={**duplicate, "source": "peer"},
             )
 
-    def _pull_rounds(self, columns_by_table: dict[str, tuple[str, ...]]) -> dict:
+    def _pull_rounds(
+        self,
+        columns_by_table: dict[str, tuple[str, ...]],
+        account_id: str | None = None,
+    ) -> dict:
         applied = skipped = rounds = 0
         conflicts: list[dict] = []
         duplicates: list[dict] = []
@@ -591,7 +595,7 @@ class SyncDaemon:
         rejected: list[dict] = []
         applied_rows: list[dict] = []
 
-        retry_report = self._retry_pull_queue(columns_by_table)
+        retry_report = self._retry_pull_queue(columns_by_table, account_id)
         applied += retry_report["applied"]
         skipped += retry_report["skipped"]
         conflicts.extend(retry_report["conflicts"])
@@ -620,6 +624,7 @@ class SyncDaemon:
                         changes,
                         incoming_side=SIDE_SERVER,
                         columns_by_table=columns_by_table or None,
+                        expected_actor_id=account_id,
                     )
                     result_by_seq = {
                         int(result["seq"]): result
@@ -709,7 +714,9 @@ class SyncDaemon:
         }
 
     def _retry_pull_queue(
-        self, columns_by_table: dict[str, tuple[str, ...]]
+        self,
+        columns_by_table: dict[str, tuple[str, ...]],
+        account_id: str | None = None,
     ) -> dict:
         report = {
             "applied": 0,
@@ -734,6 +741,7 @@ class SyncDaemon:
                     changes,
                     incoming_side=SIDE_SERVER,
                     columns_by_table=columns_by_table or None,
+                    expected_actor_id=account_id,
                 )
                 result_by_seq = {
                     int(result["seq"]): result

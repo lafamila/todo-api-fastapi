@@ -40,6 +40,47 @@ class LockHolder:
         }
 
 
+@dataclass(frozen=True)
+class ReservedLease:
+    memo_id: str
+    lease_token: str
+    generation: int
+
+    def to_dict(self) -> dict:
+        return {
+            "memoId": self.memo_id,
+            "leaseToken": self.lease_token,
+            "generation": self.generation,
+        }
+
+
+@dataclass
+class BatchReservation:
+    reservation_id: str
+    operation_id: str
+    owner_key: str
+    user_id: str
+    leases: tuple[ReservedLease, ...]
+    expires_at: float
+
+    def to_dict(self) -> dict:
+        return {
+            "reservationId": self.reservation_id,
+            "operationId": self.operation_id,
+            "ownerKey": self.owner_key,
+            "userId": self.user_id,
+            "leases": [lease.to_dict() for lease in self.leases],
+        }
+
+
+class ReservationConflict(RuntimeError):
+    """A batch cannot be reserved without changing an existing editor lease."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 # (memoId, 새 보유자|None, 직전 보유자|None) — 직전 보유자로 변경의 출처(로컬 소켓 vs 위임 피어)를 판별한다
 ChangeListener = Callable[[str, dict | None, dict | None], None]
 
@@ -50,6 +91,9 @@ class LockRegistry:
         self._locks: dict[str, LockHolder] = {}
         self._generations: dict[str, int] = {}
         self._expiry_timers: dict[str, Timer] = {}
+        self._reservations: dict[str, BatchReservation] = {}
+        self._memo_reservations: dict[str, str] = {}
+        self._reservation_timers: dict[str, Timer] = {}
         self._lock = RLock()
         self._listeners: list[ChangeListener] = []
 
@@ -70,6 +114,18 @@ class LockRegistry:
         if holder.expires_at <= monotonic():
             return None
         return holder
+
+    def _live_reservation(self, reservation_id: str) -> BatchReservation | None:
+        reservation = self._reservations.get(reservation_id)
+        if reservation is None or reservation.expires_at <= monotonic():
+            return None
+        return reservation
+
+    def _reservation_for_memo(self, memo_id: str) -> BatchReservation | None:
+        reservation_id = self._memo_reservations.get(memo_id)
+        if reservation_id is None:
+            return None
+        return self._live_reservation(reservation_id)
 
     def _schedule_expiry(self, memo_id: str, holder: LockHolder) -> None:
         previous_timer = self._expiry_timers.pop(memo_id, None)
@@ -102,6 +158,301 @@ class LockRegistry:
                     self._schedule_expiry(memo_id, current)
         if expired is not None:
             self._notify(memo_id, None, expired.to_dict())
+
+    def _schedule_reservation_expiry(self, reservation: BatchReservation) -> None:
+        previous_timer = self._reservation_timers.pop(
+            reservation.reservation_id, None
+        )
+        if previous_timer is not None:
+            previous_timer.cancel()
+        timer = Timer(
+            max(reservation.expires_at - monotonic(), 0),
+            self._expire_reservation,
+            args=(reservation.reservation_id, reservation.expires_at),
+        )
+        timer.daemon = True
+        self._reservation_timers[reservation.reservation_id] = timer
+        timer.start()
+
+    def _expire_reservation(self, reservation_id: str, expires_at: float) -> None:
+        with self._lock:
+            current = self._reservations.get(reservation_id)
+            if current is None or current.expires_at != expires_at:
+                return
+            if current.expires_at > monotonic():
+                self._schedule_reservation_expiry(current)
+                return
+            self._remove_reservation_locked(current)
+
+    def _remove_reservation_locked(self, reservation: BatchReservation) -> None:
+        self._reservations.pop(reservation.reservation_id, None)
+        for lease in reservation.leases:
+            if self._memo_reservations.get(lease.memo_id) == reservation.reservation_id:
+                self._memo_reservations.pop(lease.memo_id, None)
+        timer = self._reservation_timers.pop(reservation.reservation_id, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _reservation_matches_holders_locked(
+        self, reservation: BatchReservation
+    ) -> bool:
+        for lease in reservation.leases:
+            holder = self._live_holder(lease.memo_id)
+            if (
+                holder is None
+                or holder.owner_key != reservation.owner_key
+                or holder.user_id != reservation.user_id
+                or holder.lease_token != lease.lease_token
+                or holder.generation != lease.generation
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _canonical_claims(leases: list[dict]) -> tuple[tuple[str, str], ...]:
+        claims: list[tuple[str, str]] = []
+        for lease in leases:
+            memo_id = str(lease.get("memoId") or lease.get("memo_id") or "").strip()
+            lease_token = str(
+                lease.get("leaseToken") or lease.get("token") or ""
+            ).strip()
+            if not memo_id or not lease_token:
+                raise ReservationConflict(
+                    "invalid_lease_manifest", "every lease needs a memo id and token"
+                )
+            claims.append((memo_id, lease_token))
+        claims.sort(key=lambda item: item[0])
+        if not claims:
+            raise ReservationConflict(
+                "empty_lease_manifest", "at least one lease is required"
+            )
+        if len({memo_id for memo_id, _ in claims}) != len(claims):
+            raise ReservationConflict(
+                "duplicate_memo_lease", "a memo may appear only once"
+            )
+        return tuple(claims)
+
+    def reserve_batch(
+        self,
+        *,
+        reservation_id: str,
+        operation_id: str,
+        owner_key: str,
+        user_id: str,
+        leases: list[dict],
+    ) -> dict:
+        """Atomically reserve a complete, already-owned canonical lease set."""
+        claims = self._canonical_claims(leases)
+        with self._lock:
+            existing = self._live_reservation(reservation_id)
+            if existing is not None:
+                existing_claims = tuple(
+                    (lease.memo_id, lease.lease_token) for lease in existing.leases
+                )
+                if (
+                    existing.operation_id != operation_id
+                    or existing.owner_key != owner_key
+                    or existing.user_id != user_id
+                    or existing_claims != claims
+                    or not self._reservation_matches_holders_locked(existing)
+                ):
+                    raise ReservationConflict(
+                        "reservation_identity_mismatch",
+                        "reservation id is already bound to another lease set",
+                    )
+                return existing.to_dict()
+
+            if reservation_id in self._reservations:
+                self._remove_reservation_locked(self._reservations[reservation_id])
+
+            reserved_leases: list[ReservedLease] = []
+            for memo_id, lease_token in claims:
+                holder = self._live_holder(memo_id)
+                if (
+                    holder is None
+                    or holder.owner_key != owner_key
+                    or holder.user_id != user_id
+                    or holder.lease_token != lease_token
+                ):
+                    raise ReservationConflict(
+                        "lease_not_owned",
+                        "the complete lease set is no longer owned by one editor",
+                    )
+                other = self._reservation_for_memo(memo_id)
+                if other is not None:
+                    raise ReservationConflict(
+                        "lease_already_reserved",
+                        "one or more leases are already reserved",
+                    )
+                reserved_leases.append(
+                    ReservedLease(memo_id, lease_token, holder.generation)
+                )
+
+            expires_at = monotonic() + self._ttl
+            reservation = BatchReservation(
+                reservation_id=reservation_id,
+                operation_id=operation_id,
+                owner_key=owner_key,
+                user_id=user_id,
+                leases=tuple(reserved_leases),
+                expires_at=expires_at,
+            )
+            self._reservations[reservation_id] = reservation
+            for lease in reservation.leases:
+                self._memo_reservations[lease.memo_id] = reservation_id
+                holder = self._locks[lease.memo_id]
+                holder.expires_at = expires_at
+                self._schedule_expiry(lease.memo_id, holder)
+            self._schedule_reservation_expiry(reservation)
+            return reservation.to_dict()
+
+    def renew_batch(
+        self,
+        *,
+        reservation_id: str,
+        operation_id: str,
+        owner_key: str,
+        user_id: str,
+        leases: list[dict],
+    ) -> dict:
+        """Renew only the exact live reservation and its original generations."""
+        claims = self._canonical_claims(leases)
+        with self._lock:
+            reservation = self._live_reservation(reservation_id)
+            if reservation is None:
+                stale = self._reservations.get(reservation_id)
+                if stale is not None:
+                    self._remove_reservation_locked(stale)
+                raise ReservationConflict(
+                    "reservation_expired", "reservation is no longer active"
+                )
+            if (
+                reservation.operation_id != operation_id
+                or reservation.owner_key != owner_key
+                or reservation.user_id != user_id
+                or tuple(
+                    (lease.memo_id, lease.lease_token)
+                    for lease in reservation.leases
+                )
+                != claims
+            ):
+                raise ReservationConflict(
+                    "reservation_identity_mismatch",
+                    "reservation ownership does not match",
+                )
+            if not self._reservation_matches_holders_locked(reservation):
+                self._remove_reservation_locked(reservation)
+                raise ReservationConflict(
+                    "reservation_fence_lost", "one or more lease generations changed"
+                )
+            expires_at = monotonic() + self._ttl
+            reservation.expires_at = expires_at
+            for lease in reservation.leases:
+                holder = self._locks[lease.memo_id]
+                holder.expires_at = expires_at
+                self._schedule_expiry(lease.memo_id, holder)
+            self._schedule_reservation_expiry(reservation)
+            return reservation.to_dict()
+
+    def validate_batch(
+        self,
+        *,
+        reservation_id: str,
+        operation_id: str,
+        owner_key: str,
+        user_id: str,
+        leases: list[dict] | tuple[dict, ...] | None = None,
+    ) -> bool:
+        with self._lock:
+            reservation = self._live_reservation(reservation_id)
+            valid = bool(
+                reservation
+                and reservation.operation_id == operation_id
+                and reservation.owner_key == owner_key
+                and reservation.user_id == user_id
+                and self._reservation_matches_holders_locked(reservation)
+            )
+            if not valid or leases is None:
+                return valid
+            assert reservation is not None
+            try:
+                claims = self._canonical_claims(list(leases))
+            except ReservationConflict:
+                return False
+            expected = tuple(
+                (lease.memo_id, lease.lease_token) for lease in reservation.leases
+            )
+            if claims != expected:
+                return False
+            supplied_generations = {
+                str(lease.get("memoId") or lease.get("memo_id") or ""): lease.get(
+                    "generation"
+                )
+                for lease in leases
+            }
+            return all(
+                supplied_generations.get(lease.memo_id) == lease.generation
+                for lease in reservation.leases
+            )
+
+    def release_batch(
+        self,
+        *,
+        reservation_id: str,
+        operation_id: str,
+        owner_key: str,
+        user_id: str,
+    ) -> bool:
+        """Release only an exact live reservation; never touch editor leases."""
+        with self._lock:
+            reservation = self._live_reservation(reservation_id)
+            if reservation is None:
+                return False
+            if (
+                reservation.operation_id != operation_id
+                or reservation.owner_key != owner_key
+                or reservation.user_id != user_id
+            ):
+                return False
+            self._remove_reservation_locked(reservation)
+            return True
+
+    def revoke_batch(
+        self,
+        *,
+        reservation_id: str,
+        operation_id: str,
+        owner_key: str,
+        user_id: str,
+    ) -> list[str]:
+        """Invalidate an exact reservation and force-release only its fenced leases."""
+        released: list[tuple[str, dict]] = []
+        with self._lock:
+            reservation = self._live_reservation(reservation_id)
+            if reservation is None or (
+                reservation.operation_id != operation_id
+                or reservation.owner_key != owner_key
+                or reservation.user_id != user_id
+            ):
+                return []
+            self._remove_reservation_locked(reservation)
+            for lease in reservation.leases:
+                holder = self._live_holder(lease.memo_id)
+                if (
+                    holder is not None
+                    and holder.owner_key == owner_key
+                    and holder.user_id == user_id
+                    and holder.lease_token == lease.lease_token
+                    and holder.generation == lease.generation
+                ):
+                    self._locks.pop(lease.memo_id, None)
+                    timer = self._expiry_timers.pop(lease.memo_id, None)
+                    if timer is not None:
+                        timer.cancel()
+                    released.append((lease.memo_id, holder.to_dict()))
+        for memo_id, holder in released:
+            self._notify(memo_id, None, holder)
+        return [memo_id for memo_id, _ in released]
 
     def holder(self, memo_id: str) -> dict | None:
         with self._lock:
@@ -138,6 +489,15 @@ class LockRegistry:
         """
         with self._lock:
             current = self._live_holder(memo_id)
+            reservation = self._reservation_for_memo(memo_id)
+            if reservation is not None and (
+                current is None or current.owner_key != owner_key
+            ):
+                if current is not None:
+                    return False, current.to_dict()
+                raise ReservationConflict(
+                    "lease_reserved", "lease cannot be reassigned while reserved"
+                )
             if current is not None and current.owner_key != owner_key:
                 return False, current.to_dict()
             if current is not None:
@@ -163,7 +523,12 @@ class LockRegistry:
             self._notify(memo_id, holder.to_dict(), None)
         return True, holder.to_dict()
 
-    def release(self, memo_id: str, owner_key: str | None = None, force: bool = False) -> dict | None:
+    def release(
+        self,
+        memo_id: str,
+        owner_key: str | None = None,
+        force: bool = False,
+    ) -> dict | None:
         """해제된 보유자를 반환한다 (해제하지 않았으면 None)."""
         with self._lock:
             current = self._live_holder(memo_id)
@@ -171,6 +536,11 @@ class LockRegistry:
                 return None
             if not force and owner_key is not None and current.owner_key != owner_key:
                 return None
+            reservation = self._reservation_for_memo(memo_id)
+            if reservation is not None:
+                if not force:
+                    return None
+                self._remove_reservation_locked(reservation)
             self._locks.pop(memo_id, None)
             timer = self._expiry_timers.pop(memo_id, None)
             if timer is not None:
@@ -178,15 +548,19 @@ class LockRegistry:
         self._notify(memo_id, None, current.to_dict())
         return current.to_dict()
 
-    def release_all_for_owner(self, owner_key: str) -> list[str]:
+    def release_all_for_owner(self, owner_key: str, *, force: bool = False) -> list[str]:
         """소켓 종료 등으로 owner 가 사라졌을 때 그 owner 의 모든 락을 푼다."""
         with self._lock:
             released = [
                 (memo_id, holder.to_dict())
                 for memo_id, holder in list(self._locks.items())
                 if holder.owner_key == owner_key
+                and (force or self._reservation_for_memo(memo_id) is None)
             ]
             for memo_id, _ in released:
+                reservation = self._reservation_for_memo(memo_id)
+                if reservation is not None:
+                    self._remove_reservation_locked(reservation)
                 self._locks.pop(memo_id, None)
                 timer = self._expiry_timers.pop(memo_id, None)
                 if timer is not None:

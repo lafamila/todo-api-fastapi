@@ -46,10 +46,12 @@ src/
 ├── connectors/
 │   └── __init__.py       # DB config, get_db_connection(sync_applying=), init_db() DDL+트리거
 ├── models/               # Pydantic 모델 (auth, base, daily_tasks, attachments)
-├── routers/              # APIRouter 모듈 — auth, projects, memos, attachments, articles, daily_tasks, sync
+├── routers/              # APIRouter 모듈 — auth, projects, memos, task_rollup, attachments, articles, daily_tasks, sync
 └── services/             # session_auth(OIDC+오프라인 세션), realtime(Socket.IO), livekit,
                           # merge(중복 병합), lock_registry(락 단일 진실),
                           # memo_search(프로젝트 현재 메모 BM25 순위·강조 문맥),
+                          # task_rollup(할 일 트리/중복), task_rollup_store(원문 일괄 체크/완료/undo),
+                          # task_rollup_schema(개인 receipt 검증), task_rollup_observability(내용 없는 JSON 로그),
                           # attachment_schema/additive DDL · attachment_storage/stdlib SigV4 private S3,
                           # sync_auth(credential 검증) · sync_store(change_log/state/issues) ·
                           # sync_apply(LWW·중복 정책) · sync_peer(원격 호출) ·
@@ -186,7 +188,7 @@ prod 전용 표면(화면공유·게시·멤버초대) 숨김 판정 축은 **�
 
 ## DATABASE SCHEMA
 
-`src/connectors/__init__.py` `init_db()` 의 DDL 이 canonical 이다. 데이터 테이블 8개 +
+`src/connectors/__init__.py` `init_db()` 의 DDL 이 canonical 이다. 데이터 테이블 9개 +
 동기화용 4개(`change_log`·`sync_state`·`sync_issues`·`local_identity`, 위 OFFLINE SYNC 참조):
 
 ```text
@@ -194,6 +196,7 @@ projects               (id PK, owner_id, parent_id[직접 자식 1단계], is_gr
 memos                  (id PK, project_id FK→projects, created_by, kind[memo|backlog], title, content LONGTEXT, status, deleted_at, created_at, updated_at, updated_at_utc)
 memo_versions          (id PK, memo_id FK→memos, content LONGTEXT, version INT, note, created_at, updated_at_utc)
 memo_attachments       (id PK, memo_id FK→memos, origin_memo_id[object key 불변 원본], created_by, file_name, content_type, byte_size, is_image, sha256, object_key UNIQUE, status, created_at, updated_at_utc, deleted_at)
+task_rollup_completions (id=operation UUID PK, project_id FK, actor_id, group_key, payload_hash, data_json[불변 snapshot/원문 manifest/결과], completed_at_utc, completion_date_kst, undo_operation_id/hash/data_json[단방향], updated_at_utc, deleted_at)
 articles               (id PK, memo_id FK→memos UNIQUE, project_id FK→projects, author_id, author_slug, title, content, published_version, ...)
 project_members        (id PK, project_id FK→projects, user_id, username, display_name, email, role, invited_at, updated_at_utc, deleted_at; UNIQUE(project_id,user_id))
 daily_task_types       (id PK, name UNIQUE, icon, color, display_order, is_active, ...)
@@ -279,6 +282,26 @@ null/누락/빈 문자열이면 `loginId`와 `username`을 빈 문자열로 반�
 
 게시글은 service `admin`/`owner` 가 자신의 프로젝트 메모를 자신의 `authorSlug` 게시판으로 발행한다. `authorSlug` 는 auth token 의 `preferred_username`/email/sub 기반으로 생성하며, 공개 목록은 전체 또는 slug 별로 조회할 수 있다.
 
+### 백로그의 프로젝트 할 일 집계
+
+- [`docs/task-rollup-contract.md`](docs/task-rollup-contract.md)가 HTTP DTO·완료 기록·배포 제한의 계약이다.
+  선택된 leaf의 최신 **저장된 일반 메모**만 트리로 읽는다. 개인 백로그/과거 버전/삭제/코드/표/미저장 초안은 제외한다.
+- 기본 `all` 외에 명시적 `recent30` 범위를 지원한다. 생성일·ID 내림차순 최근 30개의 본문만 읽고 전체/선택/제외 문서 수를 반환한다.
+  오래된 문서의 metadata range도 잠그되 체크 대상에서는 제외한다. 범위는 receipt·재시도 의미에 포함하며 자동 일괄 완료는 하지 않는다.
+- 체크된 부모와 `- 설명`도 먼저 해석한 뒤 미완료 `-- ` 자식을 남긴다. 동일 문구+상위 문맥은 한 번 표시하고 하위 순서와 무관하게 합산한다.
+  긴 표현의 후보는 사용자가 선택한 표현만 일시적으로 묶으며, 각 선택 표현의 원문을 일부만 처리하지 않는다.
+- 체크는 일반 메모의 기존 쓰기 권한과 각 원문의 현재 Socket.IO lease를 요구한다. 개인 백로그를 쓸 수 있는 viewer 예외를 공유 원문에 적용하지 않는다.
+  별도 소켓이 다른 탭/기존 편집기의 잠금을 빼앗지 않으며, canonical batch reservation과 마지막 한 번의 원격 검증이 원문 전체를 보호한다.
+- SQL/parser는 제한된 worker에서 실행한다. 현재 권한·전체 코퍼스 range/gap 잠금·revision·원문을 재확인하고 선택한 접두사만 `-- `→`v-- `로 바꾼다.
+  변경 메모당 버전 한 개와 개인 완료 receipt를 같은 transaction에 저장한다. 충돌/실패 시 전부 rollback한다.
+- operation UUID의 결과 조회가 lease/CAS보다 앞선다. 응답 유실 후 같은 의미의 재요청은 이미 저장된 결과를 반환하며 토큰은 저장·로그하지 않는다.
+  undo는 이 operation이 바꾼 원문만 되돌리고, 기존 `v--` 복사본·다른 문구·메모 전체 snapshot을 복원하지 않는다.
+- 원문의 체크는 프로젝트 공유 상태다. 오늘 완료 표시용 receipt는 exact actor만 읽는다(프로젝트/서비스 관리자도 타인의 receipt 불가).
+  한국시간 다음 자정에는 표시만 숨기고 원문은 유지한다. 새 `--`/하위 작업은 과거 receipt 때문에 숨지 않는다.
+- 새 env/의존성/중앙 auth 변경은 없다. schema v5이므로 서버와 local API를 함께 갱신해야 한다. 실제 운영 배포는 사용자가 수행한다.
+  원자성은 한 DB까지이며, 아직 동기화되지 않은 오프라인 복사본까지 동시에 체크하는 분산 transaction은 아니다.
+  로그/지표 조회와 정확한 크기 제한은 계약 문서의 운영 항목을 따른다.
+
 ## CONVENTIONS
 
 - **Router 분할** — 라우트는 `src/routers/{domain}.py` 의 `APIRouter` 로 나뉘고 `__main__.py` 에서 등록한다 (과거 single-file 패턴은 폐기됨)
@@ -310,7 +333,7 @@ NAS 원격을 **단일 진실**로 두고, 노트북 로컬 스택을 outbox 를
 
 ### 스키마 (`src/connectors/__init__.py` `init_db()` 가 canonical)
 
-동기화 대상 5개 테이블(`projects`·`memos`·`memo_versions`·`memo_attachments`·`project_members`)에 추가된 것:
+동기화 대상 6개 테이블(`projects`·`memos`·`memo_versions`·`memo_attachments`·`project_members`·`task_rollup_completions`)에 적용되는 것:
 
 ```text
 updated_at_utc DATETIME(3) NOT NULL   -- 충돌 판정(LWW)의 유일한 근거. 항상 UTC
@@ -318,11 +341,12 @@ deleted_at     DATETIME(3) NULL       -- projects / project_members 에 신규 (
 memo_versions.note VARCHAR(255) NULL  -- "충돌 · 로컬 (07-29 14:02)" / "병합 · {제목} (…)"
 ```
 
-현재 `SCHEMA_VERSION=4`다. v4는 backlog owner privacy와 attachment metadata를 권한 경계로
-사용하므로 v3 이하 peer는 `allowSchemaDrift` 여부와 무관하게 push/pull 모두 fail-closed 한다.
+현재 `SCHEMA_VERSION=5`다. v4의 backlog owner/attachment privacy에 v5의 개인 rollup receipt가 추가됐다.
+v4 이하 peer는 `allowSchemaDrift` 여부와 무관하게 push/pull/bootstrap에서 fail-closed 한다. `/sync/changes`도 정확한 `schemaVersion=5` 선언을 요구한다.
 backlog memo/version/attachment/issue/lock은 exact `created_by` 계정+live membership으로 scope하고,
 일반 memo attachment는 기존 공유 범위를 따른다. object bytes는 동기화하지 않으며 양쪽 노드는 같은
 private bucket/prefix를 사용해야 한다.
+rollup receipt는 actor를 별도로 검증하며 undo/tombstone은 단방향이다. 불변 JSON은 NFC로 다시 쓰지 않는다.
 
 노드 로컬 테이블 (동기화 대상 아님):
 
@@ -342,7 +366,7 @@ local_identity (account_id PK, login_id, display_name, email, permission, issuer
 
 ### 트리거 (change_log 를 채운다)
 
-테이블당 insert/update/delete 3개, 총 15개 (`trg_{table}_{ai|au|ad}_change_log`).
+테이블당 insert/update/delete 3개, 총 18개 (`trg_{table}_{ai|au|ad}_change_log`).
 앱의 쓰기 지점 20여 곳을 각각 고치는 것보다 누락이 없고, 마이그레이션 스크립트나 손으로 실행한
 SQL 까지 잡힌다. 본문은 `IF @sync_applying IS NULL THEN … END IF` 로 감싼다:
 
@@ -360,7 +384,7 @@ SQL 까지 잡힌다. 본문은 `IF @sync_applying IS NULL THEN … END IF` 로 
 
 ```text
 GET  /api/sync/handshake                      → schemaVersion·accountId·serverTimeUtc·ownerIds·maxSeq·tables·identity
-GET  /api/sync/changes?since=<seq>&limit=500  → 계정 스코프로 필터된 변경 + nextSeq
+GET  /api/sync/changes?schemaVersion=5&since=<seq>&limit=500  → 계정 스코프로 필터된 변경 + nextSeq
 POST /api/sync/push                           → applied/skipped/deferred/conflicts/duplicates
 POST /api/sync/locks/{memoId}/acquire|release · GET /api/sync/locks/{memoId}
 POST /api/sync/merge/memos|projects/{loserId}/merge-into/{winnerId}
@@ -528,6 +552,7 @@ import 순서에 의존하지 말고 반드시 `use_scratch_database()` 를 쓴�
 | Auth/session | `routers/auth.py` | `POST /api/session/oidc/start`, `POST /api/session/logout`, `GET /api/session/me`, `POST /api/session/local`(오프라인 로그인), `GET /api/session/local/identity`, `POST /api/session/service-application`, `GET /api/users/search`, `POST /api/livekit/token` |
 | Projects | `routers/projects.py` | `GET/POST /api/projects`(parentProjectId로 자식 생성), `PATCH /api/projects/{id}`(owner rename), `DELETE /api/projects/{id}`(이름확인·recursive soft), `POST /api/projects/{id}/verify`, 병합 `POST /api/projects/{loserId}/merge-into/{winnerId}`, 멤버 snapshot 초대 `GET/POST /api/projects/{id}/members`, `DELETE /api/projects/{id}/members/{userId}`(soft) |
 | Memos | `routers/memos.py` | `GET /api/projects/{id}/memos`, `GET/POST /api/projects/{id}/backlog`, `POST /api/memos`, `GET/PUT/DELETE /api/memos/{id}`, `POST /api/memos/{id}/move`, `POST /api/memos/bulk-move`, `POST /api/memos/bulk-delete`, 버전 `GET /api/memos/{id}/versions[/{v}]`, 병합 `POST /api/memos/{loserId}/merge-into/{winnerId}` |
+| Task rollup | `routers/task_rollup.py` | `GET .../projects/{id}/backlog/task-rollup`, `POST .../preview`, `POST .../complete`, `POST .../{operationId}/undo` — 일반 원문 lease/CAS + actor-private 완료 receipt |
 | Attachments | `routers/attachments.py` | `GET/POST /api/memos/{id}/attachments`, `POST .../attachments/download`, `POST .../attachments/delete`(업로더 본인 batch tombstone), `GET /api/attachments/{id}/content` — private storage proxy, single original/multi ZIP |
 | Sync | `routers/sync.py` | 피어: `handshake`·`changes`·`push`·`locks/*`·`merge/*` (service credential) / UI: `status`·`issues`·`issues/resolve`·`pause`·`trigger` (세션) |
 | Articles | `routers/articles.py` | `POST/GET /api/articles`, `GET /api/articles/boards/{slug}`, `GET/DELETE /api/articles/{id}`, `GET /api/memos/{id}/article` |

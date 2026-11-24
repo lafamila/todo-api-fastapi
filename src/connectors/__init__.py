@@ -384,6 +384,8 @@ _SYNC_ADDITIVE_DDL = (
     "ALTER TABLE projects ADD INDEX idx_projects_parent_id (parent_id)",
     "ALTER TABLE memos ADD COLUMN kind VARCHAR(20) NOT NULL DEFAULT 'memo' AFTER created_by",
     "ALTER TABLE memos ADD INDEX idx_memos_project_kind (project_id, kind)",
+    # Full live normal-memo range + terminal gap fence for atomic rollup completion.
+    "ALTER TABLE memos ADD INDEX idx_memos_rollup_corpus (project_id, kind, deleted_at, id)",
     # updated_at_utc — 기존 DB 에는 NULL 허용으로 추가한 뒤 백필하고 NOT NULL 로 조인다
     "ALTER TABLE projects ADD COLUMN updated_at_utc DATETIME(3) NULL AFTER updated_at",
     "ALTER TABLE memos ADD COLUMN updated_at_utc DATETIME(3) NULL AFTER updated_at",
@@ -422,6 +424,7 @@ def _try_ddl(cursor, statement: str) -> None:
 
 def _init_sync_schema(cursor) -> None:
     """동기화용 컬럼·테이블·트리거를 멱등하게 반영한다."""
+    _ensure_task_rollup_completion_schema(cursor)
     for statement in _SYNC_ADDITIVE_DDL:
         _try_ddl(cursor, statement)
 
@@ -606,6 +609,54 @@ def _init_sync_schema(cursor) -> None:
     _validate_sync_schema(cursor)
 
 
+def _ensure_task_rollup_completion_schema(cursor) -> None:
+    """Create the private v5 receipt table without touching existing user rows."""
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS task_rollup_completions (
+            id VARCHAR(50) NOT NULL PRIMARY KEY,
+            project_id VARCHAR(50) NOT NULL,
+            actor_id VARCHAR(50) NOT NULL,
+            group_key VARCHAR(64) NOT NULL,
+            payload_hash VARCHAR(64) NOT NULL,
+            data_json LONGTEXT NOT NULL,
+            completed_at_utc DATETIME(3) NOT NULL,
+            completion_date_kst DATE NOT NULL,
+            undo_operation_id VARCHAR(50) NULL,
+            undo_payload_hash VARCHAR(64) NULL,
+            undo_data_json LONGTEXT NULL,
+            updated_at_utc DATETIME(3) NOT NULL,
+            deleted_at DATETIME(3) NULL,
+            CONSTRAINT fk_task_rollup_project
+                FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE RESTRICT,
+            INDEX idx_task_rollup_actor_project_date
+                (actor_id, project_id, completion_date_kst, deleted_at),
+            INDEX idx_task_rollup_project_updated
+                (project_id, updated_at_utc)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """
+    )
+    # CREATE TABLE does not repair an already-created partial development table.
+    additive = (
+        "ALTER TABLE task_rollup_completions ADD COLUMN project_id VARCHAR(50) NOT NULL AFTER id",
+        "ALTER TABLE task_rollup_completions ADD COLUMN actor_id VARCHAR(50) NOT NULL AFTER project_id",
+        "ALTER TABLE task_rollup_completions ADD COLUMN group_key VARCHAR(64) NOT NULL AFTER actor_id",
+        "ALTER TABLE task_rollup_completions ADD COLUMN payload_hash VARCHAR(64) NOT NULL AFTER group_key",
+        "ALTER TABLE task_rollup_completions ADD COLUMN data_json LONGTEXT NOT NULL AFTER payload_hash",
+        "ALTER TABLE task_rollup_completions ADD COLUMN completed_at_utc DATETIME(3) NOT NULL AFTER data_json",
+        "ALTER TABLE task_rollup_completions ADD COLUMN completion_date_kst DATE NOT NULL AFTER completed_at_utc",
+        "ALTER TABLE task_rollup_completions ADD COLUMN undo_operation_id VARCHAR(50) NULL AFTER completion_date_kst",
+        "ALTER TABLE task_rollup_completions ADD COLUMN undo_payload_hash VARCHAR(64) NULL AFTER undo_operation_id",
+        "ALTER TABLE task_rollup_completions ADD COLUMN undo_data_json LONGTEXT NULL AFTER undo_payload_hash",
+        "ALTER TABLE task_rollup_completions ADD COLUMN updated_at_utc DATETIME(3) NOT NULL AFTER undo_data_json",
+        "ALTER TABLE task_rollup_completions ADD COLUMN deleted_at DATETIME(3) NULL AFTER updated_at_utc",
+        "ALTER TABLE task_rollup_completions ADD INDEX idx_task_rollup_actor_project_date (actor_id, project_id, completion_date_kst, deleted_at)",
+        "ALTER TABLE task_rollup_completions ADD INDEX idx_task_rollup_project_updated (project_id, updated_at_utc)",
+    )
+    for statement in additive:
+        _try_ddl(cursor, statement)
+
+
 _REQUIRED_SYNC_COLUMNS = {
     "projects": {"updated_at_utc", "deleted_at"},
     "memos": {"updated_at_utc", "deleted_at"},
@@ -771,6 +822,15 @@ def _validate_sync_schema(cursor) -> None:
         ("sync_retry_queue", "payload_hash"),
         ("sync_receipts", "account_id"),
         ("sync_receipts", "payload_hash"),
+        ("task_rollup_completions", "id"),
+        ("task_rollup_completions", "project_id"),
+        ("task_rollup_completions", "actor_id"),
+        ("task_rollup_completions", "group_key"),
+        ("task_rollup_completions", "payload_hash"),
+        ("task_rollup_completions", "data_json"),
+        ("task_rollup_completions", "completed_at_utc"),
+        ("task_rollup_completions", "completion_date_kst"),
+        ("task_rollup_completions", "updated_at_utc"),
     }
     for table, column in sorted(required_not_null):
         if actual_columns.get(table, {}).get(column) != "NO":
@@ -794,6 +854,29 @@ def _validate_sync_schema(cursor) -> None:
     }
     missing.extend(
         f"trigger:{name}" for name in sorted(expected_triggers - actual_triggers)
+    )
+
+    cursor.execute(
+        """
+        SELECT TABLE_NAME, INDEX_NAME
+        FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA = %s
+          AND (TABLE_NAME = 'memos' OR TABLE_NAME = 'task_rollup_completions')
+        """,
+        (DB_CONFIG["database"],),
+    )
+    actual_indexes = {
+        (str(_field(row, "TABLE_NAME", 0)), str(_field(row, "INDEX_NAME", 1)))
+        for row in cursor.fetchall()
+    }
+    required_indexes = {
+        ("memos", "idx_memos_rollup_corpus"),
+        ("task_rollup_completions", "idx_task_rollup_actor_project_date"),
+        ("task_rollup_completions", "idx_task_rollup_project_updated"),
+    }
+    missing.extend(
+        f"index:{table}.{index}"
+        for table, index in sorted(required_indexes - actual_indexes)
     )
 
     if missing:

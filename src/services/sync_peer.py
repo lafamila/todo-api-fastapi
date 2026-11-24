@@ -106,7 +106,11 @@ class SyncPeer:
         return self._call("GET", "/api/sync/handshake")
 
     def changes(self, since: int, limit: int) -> dict:
-        return self._call("GET", f"/api/sync/changes?since={int(since)}&limit={int(limit)}")
+        return self._call(
+            "GET",
+            "/api/sync/changes?"
+            f"schemaVersion={SCHEMA_VERSION}&since={int(since)}&limit={int(limit)}",
+        )
 
     def push(self, client_id: str, changes: list[dict]) -> dict:
         return self._call(
@@ -137,6 +141,84 @@ class SyncPeer:
 
     def lock_holder(self, memo_id: str) -> dict:
         return self._call("GET", f"/api/sync/locks/{quote(memo_id)}")
+
+    def lock_reservation_reserve(
+        self,
+        reservation_id: str,
+        operation_id: str,
+        owner_key: str,
+        user_id: str,
+        leases: list[dict],
+    ) -> dict:
+        return self._call(
+            "POST",
+            "/api/sync/locks/reservations/reserve",
+            {
+                "reservationId": reservation_id,
+                "operationId": operation_id,
+                "ownerKey": owner_key,
+                "userId": user_id,
+                "leases": leases,
+            },
+        )
+
+    def lock_reservation_renew(
+        self,
+        reservation_id: str,
+        operation_id: str,
+        owner_key: str,
+        user_id: str,
+        leases: list[dict],
+    ) -> dict:
+        return self._call(
+            "POST",
+            "/api/sync/locks/reservations/renew",
+            {
+                "reservationId": reservation_id,
+                "operationId": operation_id,
+                "ownerKey": owner_key,
+                "userId": user_id,
+                "leases": leases,
+            },
+        )
+
+    def lock_reservation_release(
+        self,
+        reservation_id: str,
+        operation_id: str,
+        owner_key: str,
+        user_id: str,
+    ) -> dict:
+        return self._call(
+            "POST",
+            "/api/sync/locks/reservations/release",
+            {
+                "reservationId": reservation_id,
+                "operationId": operation_id,
+                "ownerKey": owner_key,
+                "userId": user_id,
+            },
+        )
+
+    def lock_reservation_validate(
+        self,
+        reservation_id: str,
+        operation_id: str,
+        owner_key: str,
+        user_id: str,
+        leases: list[dict],
+    ) -> dict:
+        return self._call(
+            "POST",
+            "/api/sync/locks/reservations/validate",
+            {
+                "reservationId": reservation_id,
+                "operationId": operation_id,
+                "ownerKey": owner_key,
+                "userId": user_id,
+                "leases": leases,
+            },
+        )
 
     # --- 병합 위임 --------------------------------------------------------
 

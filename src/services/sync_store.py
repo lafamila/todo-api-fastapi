@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import json
 import hashlib
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 try:
     from ..sync_schema import (
         SYNC_TABLES,
+        DATE_COLUMNS,
         UTC_COLUMNS,
         WALL_CLOCK_COLUMNS,
         table_columns,
@@ -20,7 +21,13 @@ try:
     from ..timeutil import iso_utc, parse_iso_utc, utcnow_naive
     from ..utils import generate_id
 except ImportError:  # pragma: no cover
-    from sync_schema import SYNC_TABLES, UTC_COLUMNS, WALL_CLOCK_COLUMNS, table_columns
+    from sync_schema import (
+        DATE_COLUMNS,
+        SYNC_TABLES,
+        UTC_COLUMNS,
+        WALL_CLOCK_COLUMNS,
+        table_columns,
+    )
     from timeutil import iso_utc, parse_iso_utc, utcnow_naive
     from utils import generate_id
 
@@ -117,7 +124,7 @@ def _row_project_id(cursor, table: str, row: dict) -> str | None:
     """계정 스코프 판정에 쓰는 소속 프로젝트 id."""
     if table == "projects":
         return row.get("id")
-    if table in ("memos", "project_members"):
+    if table in ("memos", "project_members", "task_rollup_completions"):
         return row.get("project_id")
     if table == "memo_versions":
         cursor.execute("SELECT project_id FROM memos WHERE id = %s", (row.get("memo_id"),))
@@ -159,6 +166,9 @@ def sync_row_visible_to_account(
     """
     if not account_id or not row:
         return True
+    if table == "task_rollup_completions":
+        # Service/project ownership never broadens this account-private scope.
+        return row.get("actor_id") == account_id
     memo = _row_memo_scope(cursor, table, row)
     if memo and (memo.get("kind") or "memo") == "backlog":
         return memo.get("created_by") == account_id
@@ -171,6 +181,8 @@ def sync_row_pushable_by_account(
     """client credential이 wire로 보낼 수 있는 로컬 row인지 판정한다."""
     if not sync_row_visible_to_account(cursor, table, row, account_id):
         return False
+    if account_id and row and table == "task_rollup_completions":
+        return row.get("project_id") in visible_project_ids(cursor, account_id)
     if account_id and row and table == "memo_attachments":
         if row.get("created_by") == account_id:
             return True
@@ -206,6 +218,8 @@ def serialize_row(table: str, row: dict, columns: tuple[str, ...] | None = None)
                 if column in UTC_COLUMNS
                 else value.isoformat(timespec="milliseconds")
             )
+        elif isinstance(value, date) or column in DATE_COLUMNS and value is not None:
+            payload[column] = value.isoformat() if hasattr(value, "isoformat") else str(value)
         elif column in {"is_secret", "is_group", "is_image"}:
             payload[column] = bool(value)
         else:
@@ -222,6 +236,8 @@ def deserialize_row(table: str, payload: dict, columns: tuple[str, ...]) -> dict
         value = payload[column]
         if column in UTC_COLUMNS:
             row[column] = parse_iso_utc(value) if value else None
+        elif column in DATE_COLUMNS:
+            row[column] = date.fromisoformat(str(value)) if value else None
         elif column in WALL_CLOCK_COLUMNS:
             row[column] = _parse_naive(value)
         elif column in {"is_secret", "is_group", "is_image"}:
@@ -299,6 +315,21 @@ def read_changes(
             continue
 
         project_id = _row_project_id(cursor, table, row)
+        if table == "task_rollup_completions":
+            # Even an owner-visible project must not expose another actor's receipt,
+            # and historical membership is insufficient for private completion data.
+            if project_id not in visible:
+                continue
+            changes.append(
+                {
+                    "seq": int(entry["seq"]),
+                    "table": table,
+                    "rowId": row_id,
+                    "op": entry["op"],
+                    "row": serialize_row(table, row, columns),
+                }
+            )
+            continue
         if table == "projects":
             # 과거 멤버십은 live rename/metadata를 계속 볼 권한이 아니다. 단,
             # project tombstone은 로컬 navigation을 숨기기 위해 전달한다.

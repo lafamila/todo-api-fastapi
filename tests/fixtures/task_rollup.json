@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "checked ancestor and description context",
+      "memos": [
+        {"id": "memo-a", "title": "Release notes", "revision": "rev-a", "content": "v-- Release\n  - production only\n    -- Ship API\n\n    -- Ship web\n"},
+        {"id": "memo-b", "title": "Copied release", "revision": "rev-b", "content": "v-- Release\n  - production only\n    v-- Ship API\n    -- Ship web"}
+      ],
+      "expected": [
+        {"kind": "task", "text": "Release", "checked": true, "actionable": false, "markers": ["v-- ", "v-- "], "children": [
+          {"kind": "description", "text": "production only", "checked": false, "actionable": false, "markers": [], "children": [
+            {"kind": "task", "text": "Ship API", "checked": false, "actionable": true, "markers": ["-- ", "v-- "], "children": []},
+            {"kind": "task", "text": "Ship web", "checked": false, "actionable": true, "markers": ["-- ", "-- "], "children": []}
+          ]}
+        ]}
+      ]
+    },
+    {
+      "name": "plain code and table groups close ancestry",
+      "memos": [
+        {"id": "memo-boundaries", "title": "Boundaries", "revision": "rev-1", "content": "-- Parent\n\n  -- blank child\nplain text\n  -- after plain\n```python\n-- hidden code\n```\n  -- after code\n┌────┬────┐\n│ -- │ x  │\n└────┴────┘\n  -- after table"}
+      ],
+      "expected": [
+        {"kind": "task", "text": "Parent", "checked": false, "actionable": true, "markers": ["-- "], "children": [
+          {"kind": "task", "text": "blank child", "checked": false, "actionable": true, "markers": ["-- "], "children": []}
+        ]},
+        {"kind": "task", "text": "after plain", "checked": false, "actionable": true, "markers": ["-- "], "children": []},
+        {"kind": "task", "text": "after code", "checked": false, "actionable": true, "markers": ["-- "], "children": []},
+        {"kind": "task", "text": "after table", "checked": false, "actionable": true, "markers": ["-- "], "children": []}
+      ]
+    },
+    {
+      "name": "supported language prefix and unterminated fence",
+      "memos": [
+        {"id": "memo-fences", "title": "Fences", "revision": "rev-1", "content": "python```\n-- hidden\n```\n-- visible\nnot-a-language```\n  -- child\n```unknown\n-- hidden forever"}
+      ],
+      "expected": [
+        {"kind": "task", "text": "visible", "checked": false, "actionable": true, "markers": ["-- "], "children": []},
+        {"kind": "task", "text": "child", "checked": false, "actionable": true, "markers": ["-- "], "children": []}
+      ]
+    }
+  ]
+}

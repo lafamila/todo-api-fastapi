@@ -6,8 +6,11 @@ import asyncio
 import os
 import unittest
 from datetime import datetime
+from unittest.mock import patch
 
 from fastapi import HTTPException
+from pymysql.cursors import DictCursor
+from pymysql.err import OperationalError
 
 from tests.scratch_db import (
     assert_scratch_database,
@@ -295,6 +298,76 @@ class ProjectControlsIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     (right["id"],),
                 )
                 self.assertEqual(len(cursor.fetchall()), 1)
+
+    async def test_move_serialization_errors_roll_back_before_returning_conflict(self) -> None:
+        group = await self._project("Group")
+        leaves = []
+        for name in ("Left", "Right"):
+            leaves.append(await projects.create_project(
+                CreateProjectRequest(
+                    name=name, icon="Beer", isSecret=False,
+                    parentProjectId=group["id"],
+                ),
+                OWNER,
+            ))
+        source, target = leaves
+        self._insert_memo("move-memo", source["id"], "Move")
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """INSERT INTO articles
+                       (id,memo_id,project_id,author_id,author_slug,title,content,
+                        published_version,created_at,published_at,updated_at)
+                       VALUES ('move-article','move-memo',%s,%s,'owner','Move','body',1,%s,%s,%s)""",
+                    (source["id"], OWNER["id"], BASE, BASE, BASE),
+                )
+                cursor.execute("SELECT COUNT(*) AS count FROM change_log")
+                before_log_count = cursor.fetchone()["count"]
+
+        execute = DictCursor.execute
+        for route in ("single", "bulk"):
+            # Unrelated operational failures must still propagate, not become 409s.
+            for code in (1020, 1205, 1213, 2006):
+                with self.subTest(route=route, code=code):
+                    injected = []
+
+                    def fail_article_update(cursor, query, args=None):
+                        if query.lstrip().startswith("UPDATE articles"):
+                            injected.append(True)
+                            raise OperationalError(code, "injected move failure")
+                        return execute(cursor, query, args)
+
+                    error_type = OperationalError if code == 2006 else HTTPException
+                    with patch.object(DictCursor, "execute", new=fail_article_update):
+                        with self.assertRaises(error_type) as raised:
+                            if route == "single":
+                                await memos.move_memo(
+                                    "move-memo", MoveMemoRequest(targetProjectId=target["id"]), OWNER
+                                )
+                            else:
+                                await memos.bulk_move_memos(
+                                    BulkMoveMemosRequest(
+                                        memoIds=["move-memo"],
+                                        sourceProjectId=source["id"],
+                                        targetProjectId=target["id"],
+                                        sourceConfirmationName="Left",
+                                        targetConfirmationName="Right",
+                                    ),
+                                    OWNER,
+                                )
+                    self.assertEqual(injected, [True])
+                    if code == 2006:
+                        self.assertEqual(raised.exception.args[0], code)
+                    else:
+                        self.assertEqual(raised.exception.status_code, 409)
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute("SELECT project_id FROM memos WHERE id = 'move-memo'")
+                            self.assertEqual(cursor.fetchone()["project_id"], source["id"])
+                            cursor.execute("SELECT project_id FROM articles WHERE id = 'move-article'")
+                            self.assertEqual(cursor.fetchone()["project_id"], source["id"])
+                            cursor.execute("SELECT COUNT(*) AS count FROM change_log")
+                            self.assertEqual(cursor.fetchone()["count"], before_log_count)
 
 
 if __name__ == "__main__":

@@ -260,7 +260,15 @@ DAILY_TASK_TABLES = ("daily_task_completions", "daily_task_types")
 
 
 def clear_target(cursor, wipe_daily_tasks: bool = False) -> None:
-    for table in ("articles", "memo_versions", "memos", "project_members", "projects"):
+    for table in (
+        "articles",
+        "task_rollup_completions",
+        "memo_attachments",
+        "memo_versions",
+        "memos",
+        "project_members",
+        "projects",
+    ):
         cursor.execute(f"DELETE FROM {table}")
     if wipe_daily_tasks:
         for table in DAILY_TASK_TABLES:
@@ -273,7 +281,14 @@ def clear_target(cursor, wipe_daily_tasks: bool = False) -> None:
 def check_updated_at_utc(cursor) -> dict[str, int]:
     """동기화 대상 테이블에서 updated_at_utc 가 비어 있는 행 수 (0 이면 백필 완료)."""
     missing: dict[str, int] = {}
-    for table in ("projects", "memos", "memo_versions", "project_members"):
+    for table in (
+        "projects",
+        "memos",
+        "memo_versions",
+        "memo_attachments",
+        "project_members",
+        "task_rollup_completions",
+    ):
         try:
             cursor.execute(
                 f"SELECT COUNT(*) AS total FROM `{table}` WHERE updated_at_utc IS NULL"
@@ -318,7 +333,15 @@ def upsert(cursor, table: str, columns: list[str], values: list, update_columns:
 
 
 # mirror 모드에서 복사하는 프로젝트 계열 테이블 — FK 삽입 순서 그대로.
-MIRROR_TABLES = ("projects", "project_members", "memos", "memo_versions", "articles")
+MIRROR_TABLES = (
+    "projects",
+    "project_members",
+    "memos",
+    "memo_versions",
+    "memo_attachments",
+    "task_rollup_completions",
+    "articles",
+)
 
 
 def migrate_mirror(args: argparse.Namespace) -> int:

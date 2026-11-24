@@ -30,6 +30,10 @@ try:
     from ..timeutil import kst_label, utcnow_naive
     from ..utils import generate_id
     from .attachment_storage import canonical_object_key
+    from .task_rollup_schema import (
+        validate_new_task_rollup_source_dependencies,
+        validate_task_rollup_sync_row,
+    )
     from .sync_store import (
         deserialize_row,
         get_sync_receipt,
@@ -49,6 +53,10 @@ except ImportError:  # pragma: no cover
     from timeutil import kst_label, utcnow_naive
     from utils import generate_id
     from services.attachment_storage import canonical_object_key
+    from services.task_rollup_schema import (
+        validate_new_task_rollup_source_dependencies,
+        validate_task_rollup_sync_row,
+    )
     from services.sync_store import (
         deserialize_row,
         get_sync_receipt,
@@ -115,6 +123,7 @@ def apply_changes(
     record_issues: bool = True,
     receipt_account_id: str | None = None,
     receipt_client_id: str | None = None,
+    expected_actor_id: str | None = None,
 ) -> ApplyOutcome:
     """변경 목록을 의존성 순서로 적용한다.
 
@@ -189,6 +198,7 @@ def apply_changes(
                     columns_by_table,
                     row_outcome,
                     record_issues,
+                    expected_actor_id or receipt_account_id,
                 )
             except Exception as exc:  # noqa: BLE001 - 한 행의 실패가 배치를 죽이지 않게
                 cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
@@ -326,6 +336,7 @@ def _apply_one(
     columns_by_table: dict[str, tuple[str, ...]] | None,
     outcome: ApplyOutcome,
     record_issues: bool,
+    expected_actor_id: str | None,
 ) -> None:
     spec = SYNC_TABLES[table]
     pk = spec["pk"]
@@ -339,11 +350,41 @@ def _apply_one(
     existing = cursor.fetchone()
 
     if change.get("op") == "delete" and change.get("row") is None:
+        if table == "task_rollup_completions":
+            outcome.rejected.append(
+                {"table": table, "rowId": row_id, "reason": "task_rollup_hard_delete_forbidden"}
+            )
+            return
         _apply_hard_delete(cursor, table, row_id, existing, outcome)
         return
 
     incoming = deserialize_row(table, change.get("row") or {}, columns)
     incoming[pk] = row_id
+    if table == "task_rollup_completions":
+        incoming = validate_task_rollup_sync_row(
+            cursor,
+            str(row_id),
+            incoming,
+            existing,
+            expected_actor_id=expected_actor_id,
+        )
+        if existing is None:
+            missing_source = validate_new_task_rollup_source_dependencies(
+                cursor, incoming
+            )
+            if missing_source is not None:
+                outcome.deferred.append(
+                    {
+                        "table": table,
+                        "rowId": row_id,
+                        "reason": f"missing_parent:memos:{missing_source}",
+                    }
+                )
+                return
+        if existing is not None and _apply_task_rollup_monotonic(
+            cursor, row_id, incoming, existing, outcome
+        ):
+            return
     incoming, deferred_reason, rejected_reason = normalize_hierarchy_row(
         cursor, table, row_id, incoming, existing
     )
@@ -459,6 +500,47 @@ def _apply_one(
             outcome,
             record_issues,
         )
+
+
+def _apply_task_rollup_monotonic(
+    cursor,
+    row_id: str,
+    incoming: dict,
+    existing: dict,
+    outcome: ApplyOutcome,
+) -> bool:
+    """Apply one-way undo/tombstone facts independently of the generic LWW clock.
+
+    An older undo result must not be lost merely because a completion-only snapshot
+    acquired a newer clock on another node.  Likewise, a tombstone cannot lose to a
+    later live snapshot.  Immutable fields have already been checked by the schema
+    validator, so this only advances absent facts to present facts.
+    """
+    existing_undo = existing.get("undo_operation_id") is not None
+    incoming_undo = incoming.get("undo_operation_id") is not None
+    advances_undo = not existing_undo and incoming_undo
+    advances_delete = existing.get("deleted_at") is None and incoming.get("deleted_at") is not None
+    if not advances_undo and not advances_delete:
+        return False
+
+    updates: list[str] = []
+    values: list = []
+    if advances_undo:
+        for column in ("undo_operation_id", "undo_payload_hash", "undo_data_json"):
+            updates.append(f"{column} = %s")
+            values.append(incoming[column])
+    if advances_delete:
+        updates.append("deleted_at = %s")
+        values.append(incoming["deleted_at"])
+    updates.append("updated_at_utc = %s")
+    values.append(max(existing.get("updated_at_utc"), incoming["updated_at_utc"]))
+    cursor.execute(
+        f"UPDATE task_rollup_completions SET {', '.join(updates)} WHERE id = %s",
+        (*values, row_id),
+    )
+    outcome.applied += 1
+    outcome.applied_refs.append({"table": "task_rollup_completions", "rowId": row_id})
+    return True
 
 
 def _iso(value: datetime | None) -> str | None:
