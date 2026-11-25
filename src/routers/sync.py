@@ -52,6 +52,7 @@ try:
     from ..timeutil import iso_utc, utcnow_naive
     from ..utils import require_memo_access
     from ..services.lock_registry import ReservationConflict, get_lock_registry
+    from ..services.task_rollup_limits import MAX_ROLLUP_MEMOS
     from ..services.merge import MergeError, merge_memos, merge_projects
     from ..services.realtime import get_realtime_server
     from ..services.sync_apply import (
@@ -108,6 +109,7 @@ except ImportError:  # pragma: no cover
     from timeutil import iso_utc, utcnow_naive
     from utils import require_memo_access
     from services.lock_registry import ReservationConflict, get_lock_registry
+    from services.task_rollup_limits import MAX_ROLLUP_MEMOS
     from services.merge import MergeError, merge_memos, merge_projects
     from services.realtime import get_realtime_server
     from services.sync_apply import (
@@ -218,7 +220,7 @@ class LockReservationRequest(BaseModel):
     )
     ownerKey: str = Field(min_length=1, max_length=256)
     userId: str = Field(min_length=1, max_length=50)
-    leases: list[LockReservationLease] = Field(min_length=1, max_length=256)
+    leases: list[LockReservationLease] = Field(min_length=1, max_length=MAX_ROLLUP_MEMOS)
 
 
 class LockReservationReleaseRequest(BaseModel):
@@ -245,7 +247,7 @@ class LockReservationValidateRequest(BaseModel):
     )
     ownerKey: str = Field(min_length=1, max_length=256)
     userId: str = Field(min_length=1, max_length=50)
-    leases: list[LockReservationFenceLease] = Field(min_length=1, max_length=256)
+    leases: list[LockReservationFenceLease] = Field(min_length=1, max_length=MAX_ROLLUP_MEMOS)
 
 
 class ResolveIssuesRequest(BaseModel):

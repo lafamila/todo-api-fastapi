@@ -246,7 +246,7 @@ def test_marker_application_rejects_stale_or_tampered_manifest(mutator) -> None:
 
 
 @pytest.mark.parametrize("memos", [
-    [memo(str(index), "") for index in range(257)],
+    [memo(str(index), "") for index in range(1025)],
     [memo("too-large", "x" * (16 * 1024 * 1024 + 1))],
     [memo("too-many-tasks", "\n".join("-- task" for _ in range(4097)))],
 ])

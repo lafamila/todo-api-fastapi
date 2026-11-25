@@ -53,6 +53,19 @@ class TaskRollupDtoAndHashTests(unittest.TestCase):
                 complete_request(occurrence_keys=[DIGEST_C, DIGEST_C])
             )
 
+    def test_complete_dto_accepts_1024_leases_and_rejects_1025(self) -> None:
+        payload = complete_request()
+        payload["leases"] = [
+            {"memoId": f"memo-{index:04d}", "token": "owned"}
+            for index in range(1024)
+        ]
+        self.assertEqual(
+            len(TaskRollupCompleteRequest.model_validate(payload).leases), 1024
+        )
+        payload["leases"].append({"memoId": "memo-1024", "token": "owned"})
+        with self.assertRaises(ValidationError):
+            TaskRollupCompleteRequest.model_validate(payload)
+
     def test_semantic_hash_excludes_tokens_and_canonicalizes_sets(self) -> None:
         first = complete_request(
             token="first-secret",
@@ -74,7 +87,7 @@ class TaskRollupDtoAndHashTests(unittest.TestCase):
             store.completion_payload_hash("project-2", first),
         )
         scoped = {**first, "memoScope": "recent30"}
-        self.assertNotEqual(
+        self.assertEqual(
             store.completion_payload_hash("project-1", first),
             store.completion_payload_hash("project-1", scoped),
         )
@@ -358,7 +371,7 @@ class TaskRollupScratchDbTests(unittest.TestCase):
             ],
         }
 
-    def _seed_large_scoped_corpus(self) -> list[str]:
+    def _seed_325_corpus(self) -> list[str]:
         created = datetime(2026, 11, 25, 0, 0, 0)
         memo_ids = [f"scope-{index:03d}" for index in range(323)]
         with get_db_connection() as conn:
@@ -458,6 +471,43 @@ class TaskRollupScratchDbTests(unittest.TestCase):
                 self.assertEqual(
                     cursor.fetchone()["undo_operation_id"], undo_request["undoOperationId"]
                 )
+        mismatched_uuid = {
+            **undo_request,
+            "undoOperationId": "00000000-0000-4000-8000-000000000003",
+        }
+        with self.assertRaises(HTTPException) as normal_conflict:
+            store.prepare_undo(
+                "rollup-project", UUID_1, self.USER, mismatched_uuid
+            )
+        self.assertEqual(normal_conflict.exception.detail["code"], "task_rollup_undo_conflict")
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT undo_data_json FROM task_rollup_completions WHERE id = %s",
+                    (UUID_1,),
+                )
+                legacy_undo = store._safe_json_load(cursor.fetchone()["undo_data_json"])
+                legacy_undo["result"]["memoScope"] = "recent30"
+                legacy_hash = store.undo_payload_hash(
+                    "rollup-project",
+                    UUID_1,
+                    undo_request,
+                    _legacy_scope="recent30",
+                )
+                cursor.execute(
+                    """
+                    UPDATE task_rollup_completions
+                    SET undo_payload_hash = %s, undo_data_json = %s
+                    WHERE id = %s
+                    """,
+                    (legacy_hash, store._canonical_json(legacy_undo), UUID_1),
+                )
+        with self.assertRaises(HTTPException) as legacy_conflict:
+            store.prepare_undo(
+                "rollup-project", UUID_1, self.USER, mismatched_uuid
+            )
+        self.assertEqual(legacy_conflict.exception.detail["code"], "task_rollup_undo_conflict")
 
     def test_injected_receipt_failure_rolls_back_memo_and_version(self) -> None:
         fixed_now = datetime(2026, 11, 24, 1, 0, 0, tzinfo=timezone.utc)
@@ -485,6 +535,60 @@ class TaskRollupScratchDbTests(unittest.TestCase):
                 self.assertEqual(cursor.fetchone()["count"], 0)
                 cursor.execute("SELECT COUNT(*) AS count FROM task_rollup_completions")
                 self.assertEqual(cursor.fetchone()["count"], 0)
+
+    def test_deprecated_scope_is_replay_only_and_bound_to_stored_receipt(self) -> None:
+        fresh = {**self._request(), "memoScope": "recent30"}
+        with self.assertRaises(HTTPException) as fresh_error:
+            store.prepare_completion("rollup-project", self.USER, fresh)
+        self.assertEqual(fresh_error.exception.status_code, 422)
+        self.assertEqual(fresh_error.exception.detail["code"], "task_rollup_scope_removed")
+
+        request = self._request()
+        work = store.prepare_completion("rollup-project", self.USER, request)
+        completed = store.commit_completion(
+            "rollup-project", self.USER, request, work, lambda: True
+        )
+        legacy_request = {**request, "memoScope": "recent30"}
+        legacy_hash = store.completion_payload_hash(
+            "rollup-project", legacy_request, _legacy_scope="recent30"
+        )
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT data_json FROM task_rollup_completions WHERE id = %s",
+                    (request["operationId"],),
+                )
+                envelope = store._safe_json_load(cursor.fetchone()["data_json"])
+                envelope["result"]["memoScope"] = "recent30"
+                cursor.execute(
+                    """
+                    UPDATE task_rollup_completions SET payload_hash = %s, data_json = %s
+                    WHERE id = %s
+                    """,
+                    (legacy_hash, store._canonical_json(envelope), request["operationId"]),
+                )
+
+        explicit_replay = store.prepare_completion(
+            "rollup-project", self.USER, legacy_request
+        )
+        no_scope_replay = store.prepare_completion(
+            "rollup-project", self.USER, request
+        )
+        self.assertEqual(explicit_replay.replay["operationId"], completed["operationId"])
+        self.assertEqual(no_scope_replay.replay["operationId"], completed["operationId"])
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE task_rollup_completions SET payload_hash = %s WHERE id = %s",
+                    (
+                        store.completion_payload_hash("rollup-project", request),
+                        request["operationId"],
+                    ),
+                )
+        with self.assertRaises(HTTPException) as rebound:
+            store.prepare_completion("rollup-project", self.USER, legacy_request)
+        self.assertEqual(rebound.exception.status_code, 409)
 
     def test_viewer_can_preview_but_cannot_complete_normal_memos(self) -> None:
         fixed_now = datetime(2026, 11, 24, 1, 0, 0, tzinfo=timezone.utc)
@@ -1187,20 +1291,21 @@ class TaskRollupScratchDbTests(unittest.TestCase):
                 cursor.execute("SELECT COUNT(*) AS count FROM task_rollup_completions")
                 self.assertEqual(cursor.fetchone()["count"], 1)
 
-    def test_recent30_scopes_325_memos_and_undoes_aged_out_source_only(self) -> None:
-        self._seed_large_scoped_corpus()
-        with self.assertRaises(HTTPException) as all_error:
-            store.preview("rollup-project", self.USER, [], "all")
-        self.assertEqual(all_error.exception.status_code, 413)
-
-        preview = store.preview("rollup-project", self.USER, [], "recent30")
-        self.assertEqual(preview["memoScope"], "recent30")
-        self.assertEqual(preview["totalMemoCount"], 325)
-        self.assertEqual(preview["selectedMemoCount"], 30)
-        self.assertEqual(preview["excludedMemoCount"], 295)
+    def test_whole_325_duplicate_corpus_complete_replay_and_undo(self) -> None:
+        self._seed_325_corpus()
+        now = datetime(2026, 11, 25, 0, 0, 0)
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE memos SET content = '-- Scoped task', updated_at = %s, updated_at_utc = %s",
+                    (now, now),
+                )
+        preview = store.preview("rollup-project", self.USER, [])
+        self.assertNotIn("memoScope", preview)
+        self.assertNotIn("selectedMemoCount", preview)
         group = next(item for item in preview["groups"] if item["text"] == "Scoped task")
-        selected_ids = {item["memoId"] for item in group["occurrences"]}
-        self.assertEqual(selected_ids, {f"scope-{index:03d}" for index in range(293, 323)})
+        memo_ids = sorted({item["memoId"] for item in group["occurrences"]})
+        self.assertEqual(len(memo_ids), 325)
         request = {
             "operationId": "00000000-0000-4000-8000-000000000010",
             "corpusDigest": preview["corpusDigest"],
@@ -1209,52 +1314,38 @@ class TaskRollupScratchDbTests(unittest.TestCase):
             "occurrenceKeys": [item["key"] for item in group["occurrences"]],
             "leases": [
                 {"memoId": memo_id, "token": f"token-{memo_id}"}
-                for memo_id in sorted(selected_ids)
+                for memo_id in memo_ids
             ],
-            "memoScope": "recent30",
         }
         work = store.prepare_completion("rollup-project", self.USER, request)
         completed = store.commit_completion(
             "rollup-project", self.USER, request, work, lambda: True
         )
-        self.assertEqual(completed["memoScope"], "recent30")
-
-        with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "SELECT id, content FROM memos WHERE id LIKE 'scope-%%' ORDER BY id"
-                )
-                by_id = {row["id"]: row["content"] for row in cursor.fetchall()}
-        self.assertTrue(all(by_id[memo_id].startswith("v-- ") for memo_id in selected_ids))
-        self.assertTrue(
-            all(by_id[f"scope-{index:03d}"].startswith("-- ") for index in range(293))
+        self.assertNotIn("memoScope", completed)
+        retry = store.prepare_completion(
+            "rollup-project",
+            self.USER,
+            {
+                **request,
+                "leases": [
+                    {"memoId": memo_id, "token": "expired"}
+                    for memo_id in memo_ids
+                ],
+            },
         )
-        recent_trails = store.preview(
-            "rollup-project", self.USER, [], "recent30"
-        )["completions"]
-        self.assertEqual([item["operationId"] for item in recent_trails], [request["operationId"]])
-
-        newest = datetime(2026, 11, 26, 0, 0, 0)
+        self.assertEqual(retry.replay, completed)
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO memos
-                        (id, project_id, created_by, kind, title, content, status,
-                         created_at, updated_at, updated_at_utc)
-                    VALUES ('scope-999', 'rollup-project', %s, 'memo', 'Newest',
-                            '-- Scoped task', 0, %s, %s, %s)
-                    """,
-                    (self.USER["id"], newest, newest, newest),
-                )
-        shifted = store.preview("rollup-project", self.USER, [], "recent30")
-        shifted_trail = shifted["completions"][0]
-        self.assertEqual(shifted_trail["status"], "ready")
+                cursor.execute("SELECT COUNT(*) AS count FROM memos WHERE content LIKE 'v-- %%'")
+                self.assertEqual(cursor.fetchone()["count"], 325)
+                cursor.execute("SELECT COUNT(*) AS count FROM memo_versions")
+                self.assertEqual(cursor.fetchone()["count"], 325)
+
+        current = store.preview("rollup-project", self.USER, [])
         undo_request = {
             "undoOperationId": "00000000-0000-4000-8000-000000000011",
-            "corpusDigest": shifted["corpusDigest"],
+            "corpusDigest": current["corpusDigest"],
             "leases": request["leases"],
-            "memoScope": "recent30",
         }
         undo_work = store.prepare_undo(
             "rollup-project", request["operationId"], self.USER, undo_request
@@ -1263,153 +1354,46 @@ class TaskRollupScratchDbTests(unittest.TestCase):
             "rollup-project", request["operationId"], self.USER,
             undo_request, undo_work, lambda: True,
         )
-        self.assertEqual(undone["memoScope"], "recent30")
+        undo_replay = store.prepare_undo(
+            "rollup-project", request["operationId"], self.USER,
+            {**undo_request, "leases": []},
+        )
+        self.assertEqual(undo_replay.replay, undone)
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(
-                    "SELECT id, content FROM memos WHERE id IN ('scope-293', 'scope-999') ORDER BY id"
-                )
-                final = {row["id"]: row["content"] for row in cursor.fetchall()}
-        self.assertTrue(final["scope-293"].startswith("-- "))
-        self.assertTrue(final["scope-999"].startswith("-- "))
+                cursor.execute("SELECT COUNT(*) AS count FROM memos WHERE content LIKE '-- %%'")
+                self.assertEqual(cursor.fetchone()["count"], 325)
+                cursor.execute("SELECT COUNT(*) AS count FROM memo_versions")
+                self.assertEqual(cursor.fetchone()["count"], 650)
+                cursor.execute("SELECT COUNT(*) AS count FROM task_rollup_completions")
+                self.assertEqual(cursor.fetchone()["count"], 1)
 
-    def test_recent30_new_memo_between_preview_and_commit_is_409_no_writes(self) -> None:
-        self._seed_large_scoped_corpus()
-        preview = store.preview("rollup-project", self.USER, [], "recent30")
-        group = next(item for item in preview["groups"] if item["text"] == "Scoped task")
-        selected_ids = sorted({item["memoId"] for item in group["occurrences"]})
-        request = {
-            "operationId": "00000000-0000-4000-8000-000000000012",
-            "corpusDigest": preview["corpusDigest"],
-            "groupKey": group["key"],
-            "aliases": [],
-            "occurrenceKeys": [item["key"] for item in group["occurrences"]],
-            "leases": [
-                {"memoId": memo_id, "token": f"token-{memo_id}"}
-                for memo_id in selected_ids
-            ],
-            "memoScope": "recent30",
-        }
-        work = store.prepare_completion("rollup-project", self.USER, request)
-        newest = datetime(2026, 11, 26, 0, 0, 0)
+    def test_whole_project_over_1024_memos_is_413_without_writes(self) -> None:
+        now = datetime(2026, 11, 25, 0, 0, 0)
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(
+                cursor.executemany(
                     """
                     INSERT INTO memos
                         (id, project_id, created_by, kind, title, content, status,
                          created_at, updated_at, updated_at_utc)
-                    VALUES ('scope-999', 'rollup-project', %s, 'memo', 'Newest',
-                            '-- Scoped task', 0, %s, %s, %s)
+                    VALUES (%s, 'rollup-project', %s, 'memo', %s, '', 0, %s, %s, %s)
                     """,
-                    (self.USER["id"], newest, newest, newest),
+                    [
+                        (f"over-{index:04d}", self.USER["id"], f"Over {index}", now, now, now)
+                        for index in range(1023)
+                    ],
                 )
         with self.assertRaises(HTTPException) as raised:
-            store.commit_completion(
-                "rollup-project", self.USER, request, work, lambda: True
-            )
-        self.assertEqual(raised.exception.status_code, 409)
-        with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT COUNT(*) AS count FROM memo_versions")
-                self.assertEqual(cursor.fetchone()["count"], 0)
-                cursor.execute("SELECT COUNT(*) AS count FROM task_rollup_completions")
-                self.assertEqual(cursor.fetchone()["count"], 0)
-
-    def test_completion_trails_are_filtered_by_recorded_scope(self) -> None:
-        preview = store.preview("rollup-project", self.USER, [], "recent30")
-        group = next(item for item in preview["groups"] if item["text"] == "caf\u00e9 \U0001f600")
-        request = {
-            "operationId": "00000000-0000-4000-8000-000000000013",
-            "corpusDigest": preview["corpusDigest"],
-            "groupKey": group["key"],
-            "aliases": [],
-            "occurrenceKeys": [item["key"] for item in group["occurrences"]],
-            "leases": [{"memoId": "rollup-memo", "token": "owned"}],
-            "memoScope": "recent30",
-        }
-        work = store.prepare_completion("rollup-project", self.USER, request)
-        store.commit_completion(
-            "rollup-project", self.USER, request, work, lambda: True
-        )
-
-        recent = store.preview("rollup-project", self.USER, [], "recent30")
-        all_scope = store.preview("rollup-project", self.USER, [], "all")
-        self.assertEqual([item["operationId"] for item in recent["completions"]], [request["operationId"]])
-        self.assertEqual(all_scope["completions"], [])
-
-    def test_recent30_metadata_ceiling_rejects_whole_preview_without_writes(self) -> None:
-        with patch.object(store, "MAX_METADATA_MEMOS", 1):
-            with self.assertRaises(HTTPException) as raised:
-                store.preview("rollup-project", self.USER, [], "recent30")
-
+            store.preview("rollup-project", self.USER, [])
         self.assertEqual(raised.exception.status_code, 413)
-        self.assertEqual(raised.exception.detail["code"], "tooManyMemoMetadata")
+        self.assertEqual(raised.exception.detail["code"], "tooManyMemos")
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("SELECT COUNT(*) AS count FROM memo_versions")
                 self.assertEqual(cursor.fetchone()["count"], 0)
                 cursor.execute("SELECT COUNT(*) AS count FROM task_rollup_completions")
                 self.assertEqual(cursor.fetchone()["count"], 0)
-
-    def test_recent30_full_metadata_gap_lock_blocks_concurrent_insert(self) -> None:
-        preview = store.preview("rollup-project", self.USER, [], "recent30")
-        group = next(item for item in preview["groups"] if item["text"] == "caf\u00e9 \U0001f600")
-        request = {
-            "operationId": "00000000-0000-4000-8000-000000000014",
-            "corpusDigest": preview["corpusDigest"],
-            "groupKey": group["key"],
-            "aliases": [],
-            "occurrenceKeys": [item["key"] for item in group["occurrences"]],
-            "leases": [{"memoId": "rollup-memo", "token": "owned"}],
-            "memoScope": "recent30",
-        }
-        work = store.prepare_completion("rollup-project", self.USER, request)
-        locked = threading.Event()
-        release = threading.Event()
-
-        def hook(stage: str) -> None:
-            if stage == "memo:rollup-memo":
-                locked.set()
-                if not release.wait(3):
-                    raise RuntimeError("recent30 phantom race barrier timed out")
-
-        def insert_phantom() -> None:
-            now = datetime(2026, 11, 26, 0, 0, 0)
-            with get_db_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute(
-                        """
-                        INSERT INTO memos
-                            (id, project_id, created_by, kind, title, content, status,
-                             created_at, updated_at, updated_at_utc)
-                        VALUES ('zz-recent-phantom', 'rollup-project', %s, 'memo',
-                                'Recent phantom', '-- caf\u00e9 \U0001f600', 0, %s, %s, %s)
-                        """,
-                        (self.USER["id"], now, now, now),
-                    )
-
-        with patch.object(store, "_failure_point", side_effect=hook):
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                completion_future = pool.submit(
-                    store.commit_completion,
-                    "rollup-project", self.USER, request, work, lambda: True,
-                )
-                self.assertTrue(locked.wait(3))
-                insert_future = pool.submit(insert_phantom)
-                time.sleep(0.25)
-                self.assertFalse(insert_future.done())
-                release.set()
-                completed = completion_future.result(timeout=5)
-                insert_future.result(timeout=5)
-
-        self.assertEqual(completed["memoScope"], "recent30")
-        with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT content FROM memos WHERE id = 'zz-recent-phantom'")
-                self.assertTrue(cursor.fetchone()["content"].startswith("-- "))
-                cursor.execute("SELECT COUNT(*) AS count FROM task_rollup_completions")
-                self.assertEqual(cursor.fetchone()["count"], 1)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 Id = Annotated[str, Field(min_length=1, max_length=50)]
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
-MemoScope = Literal["all", "recent30"]
+try:
+    from ..services.task_rollup_limits import MAX_ROLLUP_MEMOS
+except ImportError:  # pragma: no cover
+    from services.task_rollup_limits import MAX_ROLLUP_MEMOS
 
 
 class _StrictModel(BaseModel):
@@ -34,7 +37,6 @@ class TaskRollupLease(_StrictModel):
 
 class TaskRollupPreviewRequest(_StrictModel):
     aliases: list[TaskRollupAlias] = Field(default_factory=list, max_length=4096)
-    memoScope: MemoScope = "all"
 
 
 class TaskRollupCompleteRequest(_StrictModel):
@@ -43,8 +45,10 @@ class TaskRollupCompleteRequest(_StrictModel):
     groupKey: Digest
     aliases: list[TaskRollupAlias] = Field(default_factory=list, max_length=4096)
     occurrenceKeys: list[Digest] = Field(min_length=1, max_length=4096)
-    leases: list[TaskRollupLease] = Field(default_factory=list, max_length=256)
-    memoScope: MemoScope = "all"
+    leases: list[TaskRollupLease] = Field(default_factory=list, max_length=MAX_ROLLUP_MEMOS)
+    memoScope: Literal["all", "recent30"] | None = Field(
+        default=None, deprecated=True
+    )
 
     @field_validator("operationId")
     @classmethod
@@ -76,8 +80,10 @@ class TaskRollupCompleteRequest(_StrictModel):
 class TaskRollupUndoRequest(_StrictModel):
     undoOperationId: Id
     corpusDigest: Digest
-    leases: list[TaskRollupLease] = Field(default_factory=list, max_length=256)
-    memoScope: MemoScope = "all"
+    leases: list[TaskRollupLease] = Field(default_factory=list, max_length=MAX_ROLLUP_MEMOS)
+    memoScope: Literal["all", "recent30"] | None = Field(
+        default=None, deprecated=True
+    )
 
     @field_validator("undoOperationId")
     @classmethod

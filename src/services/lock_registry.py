@@ -17,8 +17,10 @@ from typing import Callable
 
 try:
     from ..config import SYNC_LOCK_TTL_SECONDS
+    from .task_rollup_limits import MAX_ROLLUP_MEMOS
 except ImportError:  # pragma: no cover
     from config import SYNC_LOCK_TTL_SECONDS
+    from services.task_rollup_limits import MAX_ROLLUP_MEMOS
 
 
 @dataclass
@@ -222,6 +224,10 @@ class LockRegistry:
                 )
             claims.append((memo_id, lease_token))
         claims.sort(key=lambda item: item[0])
+        if len(claims) > MAX_ROLLUP_MEMOS:
+            raise ReservationConflict(
+                "too_many_memo_leases", "task rollup memo lease limit exceeded"
+            )
         if not claims:
             raise ReservationConflict(
                 "empty_lease_manifest", "at least one lease is required"

@@ -22,6 +22,7 @@ try:
         apply_markers,
         build_rollup,
     )
+    from .task_rollup_limits import MAX_ROLLUP_MEMOS
     from .task_rollup_schema import (
         TaskRollupSchemaError,
         canonical_json_text,
@@ -39,6 +40,7 @@ except ImportError:  # pragma: no cover
         apply_markers,
         build_rollup,
     )
+    from services.task_rollup_limits import MAX_ROLLUP_MEMOS
     from services.task_rollup_schema import (
         TaskRollupSchemaError,
         canonical_json_text,
@@ -48,9 +50,6 @@ except ImportError:  # pragma: no cover
 
 
 MAX_JSON_BYTES = 1024 * 1024
-RECENT_MEMO_LIMIT = 30
-MAX_ALL_MEMOS = 256
-MAX_METADATA_MEMOS = 65_536
 MEMO_COLUMNS = (
     "id, project_id, created_by, kind, title, content, status, "
     "created_at, updated_at, updated_at_utc, deleted_at"
@@ -115,7 +114,9 @@ def _normalized_aliases(aliases: list[dict]) -> list[dict]:
     )
 
 
-def completion_payload_hash(project_id: str, request: dict) -> str:
+def completion_payload_hash(
+    project_id: str, request: dict, *, _legacy_scope: str = "all"
+) -> str:
     """Hash semantic intent only; lease credentials are deliberately excluded."""
     semantic = {
         "aliases": _normalized_aliases(request.get("aliases", [])),
@@ -123,19 +124,54 @@ def completion_payload_hash(project_id: str, request: dict) -> str:
         "groupKey": request["groupKey"],
         "occurrenceKeys": sorted(request["occurrenceKeys"]),
         "projectId": project_id,
-        "memoScope": request.get("memoScope", "all"),
+        # Compatibility-only constant: the removed product selector previously
+        # hashed the default `all` value. Keeping it preserves issued receipts.
+        "memoScope": _legacy_scope,
     }
     return hashlib.sha256(_canonical_json(semantic).encode("utf-8")).hexdigest()
 
 
-def undo_payload_hash(project_id: str, operation_id: str, request: dict) -> str:
+def undo_payload_hash(
+    project_id: str,
+    operation_id: str,
+    request: dict,
+    *,
+    _legacy_scope: str = "all",
+) -> str:
     semantic = {
         "completionOperationId": operation_id,
         "corpusDigest": request["corpusDigest"],
         "projectId": project_id,
-        "memoScope": request.get("memoScope", "all"),
+        "memoScope": _legacy_scope,
     }
     return hashlib.sha256(_canonical_json(semantic).encode("utf-8")).hexdigest()
+
+
+def _accepted_undo_payload_hashes(
+    project_id: str,
+    operation_id: str,
+    request: dict,
+    recorded_scope: str,
+) -> set[str]:
+    requested_scope = request.get("memoScope")
+    if requested_scope is not None:
+        return {
+            undo_payload_hash(
+                project_id,
+                operation_id,
+                request,
+                _legacy_scope=requested_scope,
+            )
+        }
+    return {
+        undo_payload_hash(project_id, operation_id, request),
+        undo_payload_hash(
+            project_id,
+            operation_id,
+            request,
+            _legacy_scope=recorded_scope,
+        ),
+    }
 
 
 def _content_hash(content: str) -> str:
@@ -290,80 +326,35 @@ def _load_corpus(cursor, project_id: str, *, for_update: bool = False) -> list[d
     ]
 
 
-def _load_scoped_corpus(
+def _load_whole_corpus(
     cursor,
     project_id: str,
-    memo_scope: str,
     *,
     for_update: bool = False,
 ) -> tuple[list[dict], int]:
-    if memo_scope == "all":
-        lock = "FOR UPDATE" if for_update else ""
-        index = "FORCE INDEX (idx_memos_rollup_corpus)" if for_update else ""
-        cursor.execute(
-            f"""
-            SELECT id FROM memos {index}
-            WHERE project_id = %s AND kind = 'memo' AND deleted_at IS NULL
-            ORDER BY id LIMIT %s
-            {lock}
-            """,
-            (project_id, MAX_ALL_MEMOS + 1),
-        )
-        if len(cursor.fetchall()) > MAX_ALL_MEMOS:
-            raise HTTPException(
-                status_code=413,
-                detail={"code": "tooManyMemos", "message": "task rollup memo limit exceeded"},
-            )
-        rows = _load_corpus(cursor, project_id, for_update=for_update)
-        return rows, len(rows)
-    if memo_scope != "recent30":
-        raise HTTPException(status_code=422, detail="Invalid memoScope")
-
     lock = "FOR UPDATE" if for_update else ""
     index = "FORCE INDEX (idx_memos_rollup_corpus)" if for_update else ""
     cursor.execute(
         f"""
-        SELECT id, created_at
+        SELECT id
         FROM memos {index}
         WHERE project_id = %s AND kind = 'memo' AND deleted_at IS NULL
         ORDER BY id LIMIT %s
         {lock}
         """,
-        (project_id, MAX_METADATA_MEMOS + 1),
+        (project_id, MAX_ROLLUP_MEMOS + 1),
     )
     metadata = cursor.fetchall()
-    if len(metadata) > MAX_METADATA_MEMOS:
+    if len(metadata) > MAX_ROLLUP_MEMOS:
         raise HTTPException(
             status_code=413,
             detail={
-                "code": "tooManyMemoMetadata",
-                "message": "task rollup metadata limit exceeded",
+                "code": "tooManyMemos",
+                "message": "task rollup memo limit exceeded",
             },
         )
-    selected = sorted(
-        metadata,
-        key=lambda row: (row["created_at"], row["id"]),
-        reverse=True,
-    )[:RECENT_MEMO_LIMIT]
-    selected_ids = sorted(row["id"] for row in selected)
-    if not selected_ids:
-        return [], len(metadata)
-    placeholders = ", ".join(["%s"] * len(selected_ids))
-    cursor.execute(
-        f"""
-        SELECT {MEMO_COLUMNS}
-        FROM memos
-        WHERE project_id = %s AND kind = 'memo' AND deleted_at IS NULL
-          AND id IN ({placeholders})
-        ORDER BY id
-        {lock}
-        """,
-        (project_id, *selected_ids),
-    )
-    rows = cursor.fetchall()
-    if [row["id"] for row in rows] != selected_ids:
-        raise HTTPException(status_code=409, detail={"code": "task_rollup_corpus_changed"})
-    return [{**row, "revision": memo_revision(row)} for row in rows], len(metadata)
+    rows = _load_corpus(cursor, project_id, for_update=for_update)
+    return rows, len(metadata)
 
 
 def _parser_memos(rows: list[dict]) -> list[dict]:
@@ -418,18 +409,39 @@ def _require_live_receipt(row: dict) -> None:
         raise HTTPException(status_code=404, detail="Task rollup completion not found")
 
 
-def _completion_replay(row: dict, payload_hash: str) -> dict:
+def _completion_replay(
+    row: dict,
+    payload_hash: str,
+    compatible_hashes: tuple[str, ...] = (),
+    expected_legacy_scope: str | None = None,
+) -> dict:
     if row.get("deleted_at") is not None:
         raise HTTPException(
             status_code=409,
             detail={"code": "task_rollup_operation_deleted", "message": "Operation is no longer available"},
         )
-    if row["payload_hash"] != payload_hash:
+    data = _validated_completion_data(row["data_json"])
+    if (
+        expected_legacy_scope is not None
+        and data["result"].get("memoScope", "all") != expected_legacy_scope
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "task_rollup_operation_conflict", "message": "Operation scope does not match"},
+        )
+    recorded_scope = data["result"].get("memoScope", "all")
+    if expected_legacy_scope is not None:
+        accepted_hashes = set(compatible_hashes)
+    else:
+        accepted_hashes = {payload_hash}
+        if recorded_scope == "recent30":
+            accepted_hashes.update(compatible_hashes)
+    if row["payload_hash"] not in accepted_hashes:
         raise HTTPException(
             status_code=409,
             detail={"code": "task_rollup_operation_conflict", "message": "Operation payload does not match"},
         )
-    return _validated_completion_data(row["data_json"])["result"]
+    return data["result"]
 
 
 def _group_occurrences(group: dict) -> list[dict]:
@@ -508,17 +520,36 @@ def _validate_lease_manifest(required: tuple[str, ...], request: dict) -> None:
 def prepare_completion(project_id: str, user: dict, request: dict) -> RollupWork:
     _ensure_json_limit(request, "request")
     payload_hash = completion_payload_hash(project_id, request)
+    legacy_scope = request.get("memoScope")
+    compatibility_scope = legacy_scope or "recent30"
+    compatible_hashes = (
+        completion_payload_hash(
+            project_id, request, _legacy_scope=compatibility_scope
+        ),
+    )
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             _load_project_scope(cursor, project_id, user, write=False)
             row = _receipt(cursor, request["operationId"])
             if row:
                 _validate_receipt_identity(row, project_id, user["id"])
-                return RollupWork(payload_hash, (), _completion_replay(row, payload_hash))
+                return RollupWork(
+                    payload_hash,
+                    (),
+                    _completion_replay(
+                        row,
+                        payload_hash,
+                        compatible_hashes,
+                        expected_legacy_scope=legacy_scope,
+                    ),
+                )
+            if legacy_scope is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "task_rollup_scope_removed", "message": "memoScope is accepted only for replaying an issued operation"},
+                )
             _load_project_scope(cursor, project_id, user, write=True)
-            rows, _total = _load_scoped_corpus(
-                cursor, project_id, request.get("memoScope", "all")
-            )
+            rows, _total = _load_whole_corpus(cursor, project_id)
     rollup = _build(rows, request.get("aliases", []))
     _group, _matched, changed, _context = _validate_selection(rollup, request)
     required = tuple(sorted({item["memoId"] for item in changed}))
@@ -605,6 +636,13 @@ def commit_completion(
     final_validate_reservation: Callable[[], bool] | None = None,
 ) -> dict:
     final_validate_reservation = final_validate_reservation or validate_reservation
+    legacy_scope = request.get("memoScope")
+    compatibility_scope = legacy_scope or "recent30"
+    compatible_hashes = (
+        completion_payload_hash(
+            project_id, request, _legacy_scope=compatibility_scope
+        ),
+    )
     now, now_naive = _now_pair()
     now_local = now.astimezone(KST).replace(tzinfo=None)
     expires = _next_kst_boundary(now)
@@ -617,20 +655,28 @@ def commit_completion(
                 existing = _receipt(cursor, request["operationId"])
                 if existing:
                     _validate_receipt_identity(existing, project_id, user["id"])
-                    result = _completion_replay(existing, work.payload_hash)
+                    result = _completion_replay(
+                        existing,
+                        work.payload_hash,
+                        compatible_hashes,
+                        expected_legacy_scope=legacy_scope,
+                    )
                     _ensure_reservation(final_validate_reservation)
                     conn.commit()
                     emit_rollup_event("complete", "replay", stage="transaction", project_id=project_id,
                                       operation_id=request["operationId"])
                     return result
 
+                if legacy_scope is not None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={"code": "task_rollup_scope_removed", "message": "memoScope is accepted only for replaying an issued operation"},
+                    )
+
                 _require_write_scope(scope)
 
-                rows, _total = _load_scoped_corpus(
-                    cursor,
-                    project_id,
-                    request.get("memoScope", "all"),
-                    for_update=True,
+                rows, _total = _load_whole_corpus(
+                    cursor, project_id, for_update=True
                 )
                 _ensure_reservation(validate_reservation)
                 rollup = _build(rows, request.get("aliases", []))
@@ -673,7 +719,6 @@ def commit_completion(
                     "groupKey": request["groupKey"],
                     "group": _checked_group(group),
                     "context": context,
-                    "memoScope": request.get("memoScope", "all"),
                     "changedMemoIds": list(required),
                     "afterManifest": after_manifest,
                     "completedAtUtc": iso_utc(now_naive),
@@ -823,7 +868,6 @@ def _visible_completions(
     user: dict,
     rows: list[dict],
     now: datetime,
-    memo_scope: str,
 ) -> list[dict]:
     cursor.execute(
         """
@@ -841,8 +885,6 @@ def _visible_completions(
     missing_ids: set[str] = set()
     for stored in stored_rows:
         data = _validated_completion_data(stored["data_json"])
-        if data["result"].get("memoScope", "all") != memo_scope:
-            continue
         undo = (
             _validated_undo_data(stored["undo_data_json"])
             if stored.get("undo_data_json")
@@ -886,18 +928,15 @@ def preview(
     project_id: str,
     user: dict,
     aliases: list[dict],
-    memo_scope: str = "all",
 ) -> dict:
-    _ensure_json_limit({"aliases": aliases, "memoScope": memo_scope}, "request")
+    _ensure_json_limit({"aliases": aliases}, "request")
     now, _now_naive = _now_pair()
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             scope = _load_project_scope(cursor, project_id, user, write=False)
-            rows, total_count = _load_scoped_corpus(
-                cursor, project_id, memo_scope
-            )
+            rows, _total_count = _load_whole_corpus(cursor, project_id)
             completions = _visible_completions(
-                cursor, project_id, user, rows, now, memo_scope
+                cursor, project_id, user, rows, now
             )
     rollup = _build(rows, aliases)
     result = {
@@ -910,10 +949,6 @@ def preview(
         "candidates": rollup["candidates"],
         "aliases": rollup["aliases"],
         "completions": completions,
-        "memoScope": memo_scope,
-        "totalMemoCount": total_count,
-        "selectedMemoCount": len(rows),
-        "excludedMemoCount": total_count - len(rows),
     }
     _ensure_json_limit(result, "preview result")
     return result
@@ -932,18 +967,37 @@ def prepare_undo(project_id: str, operation_id: str, user: dict, request: dict) 
             _validate_receipt_identity(row, project_id, user["id"])
             _require_live_receipt(row)
             if row.get("undo_operation_id"):
-                if row["undo_operation_id"] != request["undoOperationId"] or row["undo_payload_hash"] != payload_hash:
+                replay_result = _validated_undo_data(row["undo_data_json"])["result"]
+                requested_legacy_scope = request.get("memoScope")
+                recorded_scope = replay_result.get("memoScope", "all")
+                if (
+                    requested_legacy_scope is not None
+                    and requested_legacy_scope != recorded_scope
+                ):
                     raise HTTPException(status_code=409, detail={"code": "task_rollup_undo_conflict"})
-                replay = _validated_undo_data(row["undo_data_json"])["result"]
-                if replay.get("memoScope", "all") != request.get("memoScope", "all"):
-                    raise HTTPException(status_code=409, detail={"code": "task_rollup_scope_changed"})
-                return RollupWork(payload_hash, (), replay)
+                if row["undo_operation_id"] != request["undoOperationId"]:
+                    raise HTTPException(status_code=409, detail={"code": "task_rollup_undo_conflict"})
+                if row["undo_payload_hash"] not in _accepted_undo_payload_hashes(
+                    project_id, operation_id, request, recorded_scope
+                ):
+                    raise HTTPException(status_code=409, detail={"code": "task_rollup_undo_conflict"})
+                return RollupWork(payload_hash, (), replay_result)
             _load_project_scope(cursor, project_id, user, write=True)
             if row["completion_date_kst"] != now.astimezone(KST).date():
                 raise HTTPException(status_code=409, detail={"code": "task_rollup_undo_expired"})
             data = _validated_completion_data(row["data_json"])
-            if data["result"].get("memoScope", "all") != request.get("memoScope", "all"):
-                raise HTTPException(status_code=409, detail={"code": "task_rollup_scope_changed"})
+            if (
+                request.get("memoScope") is not None
+                and request["memoScope"] != data["result"].get("memoScope", "all")
+            ):
+                raise HTTPException(status_code=409, detail={"code": "task_rollup_undo_conflict"})
+            if request.get("memoScope") is not None:
+                payload_hash = undo_payload_hash(
+                    project_id,
+                    operation_id,
+                    request,
+                    _legacy_scope=request["memoScope"],
+                )
             required = tuple(sorted({item["memoId"] for item in data.get("changedOccurrences", [])}))
     _validate_lease_manifest(required, request)
     return RollupWork(payload_hash, required)
@@ -973,11 +1027,23 @@ def commit_undo(
                 _validate_receipt_identity(row, project_id, user["id"])
                 _require_live_receipt(row)
                 if row.get("undo_operation_id"):
-                    if row["undo_operation_id"] != request["undoOperationId"] or row["undo_payload_hash"] != work.payload_hash:
-                        raise HTTPException(status_code=409, detail={"code": "task_rollup_undo_conflict"})
                     result = _validated_undo_data(row["undo_data_json"])["result"]
-                    if result.get("memoScope", "all") != request.get("memoScope", "all"):
-                        raise HTTPException(status_code=409, detail={"code": "task_rollup_scope_changed"})
+                    if (
+                        request.get("memoScope") is not None
+                        and request["memoScope"] != result.get("memoScope", "all")
+                    ):
+                        raise HTTPException(status_code=409, detail={"code": "task_rollup_undo_conflict"})
+                    if (
+                        row["undo_operation_id"] != request["undoOperationId"]
+                        or row["undo_payload_hash"]
+                        not in _accepted_undo_payload_hashes(
+                            project_id,
+                            operation_id,
+                            request,
+                            result.get("memoScope", "all"),
+                        )
+                    ):
+                        raise HTTPException(status_code=409, detail={"code": "task_rollup_undo_conflict"})
                     _ensure_reservation(final_validate_reservation)
                     conn.commit()
                     emit_rollup_event("undo", "replay", stage="transaction", project_id=project_id,
@@ -988,13 +1054,14 @@ def commit_undo(
                     raise HTTPException(status_code=409, detail={"code": "task_rollup_undo_expired"})
 
                 completion_data = _validated_completion_data(row["data_json"])
-                if completion_data["result"].get("memoScope", "all") != request.get("memoScope", "all"):
-                    raise HTTPException(status_code=409, detail={"code": "task_rollup_scope_changed"})
-                rows, _total = _load_scoped_corpus(
-                    cursor,
-                    project_id,
-                    request.get("memoScope", "all"),
-                    for_update=True,
+                if (
+                    request.get("memoScope") is not None
+                    and request["memoScope"]
+                    != completion_data["result"].get("memoScope", "all")
+                ):
+                    raise HTTPException(status_code=409, detail={"code": "task_rollup_undo_conflict"})
+                rows, _total = _load_whole_corpus(
+                    cursor, project_id, for_update=True
                 )
                 _ensure_reservation(validate_reservation)
                 rollup = _build(rows, [])
@@ -1091,7 +1158,7 @@ def load_changed_memos(
     ids = tuple(sorted(set(memo_ids)))
     if not ids:
         return []
-    if len(ids) > 256:
+    if len(ids) > MAX_ROLLUP_MEMOS:
         raise RuntimeError("task rollup changed memo set exceeds its limit")
     placeholders = ", ".join(["%s"] * len(ids))
     with get_db_connection() as conn:

@@ -5,13 +5,12 @@ import json
 import logging
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 try:
     from ..services.task_rollup_observability import RollupRequestObservation, emit_rollup_event
     from ..auth_utils import get_current_user
     from ..models.task_rollup import (
-        MemoScope,
         TaskRollupCompleteRequest,
         TaskRollupPreviewRequest,
         TaskRollupUndoRequest,
@@ -30,7 +29,6 @@ except ImportError:  # pragma: no cover
     from services.task_rollup_observability import RollupRequestObservation, emit_rollup_event
     from auth_utils import get_current_user
     from models.task_rollup import (
-        MemoScope,
         TaskRollupCompleteRequest,
         TaskRollupPreviewRequest,
         TaskRollupUndoRequest,
@@ -188,14 +186,10 @@ async def _notify_project_changed(project_id: str, user: dict, result: dict) -> 
 
 @router.get("/projects/{project_id}/backlog/task-rollup")
 async def get_task_rollup_preview(
-    project_id: str,
-    memo_scope: MemoScope = Query(default="all", alias="memoScope"),
-    user: dict = Depends(get_current_user),
+    project_id: str, user: dict = Depends(get_current_user)
 ):
     with RollupRequestObservation("preview", project_id) as observed:
-        return observed.finish(
-            await _bounded_worker(preview, project_id, user, [], memo_scope)
-        )
+        return observed.finish(await _bounded_worker(preview, project_id, user, []))
 
 
 @router.post("/projects/{project_id}/backlog/task-rollup/preview")
@@ -211,9 +205,7 @@ async def post_task_rollup_preview(
             raise HTTPException(status_code=413, detail={"code": "task_rollup_payload_too_large"})
         payload = _request_dict(data)
         return observed.finish(
-            await _bounded_worker(
-                preview, project_id, user, payload["aliases"], payload["memoScope"]
-            )
+            await _bounded_worker(preview, project_id, user, payload["aliases"])
         )
 
 

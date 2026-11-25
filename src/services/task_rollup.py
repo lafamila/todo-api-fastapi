@@ -16,7 +16,12 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
 
-MAX_MEMOS = 256
+try:
+    from .task_rollup_limits import MAX_ROLLUP_MEMOS
+except ImportError:  # pragma: no cover
+    from services.task_rollup_limits import MAX_ROLLUP_MEMOS
+
+MAX_MEMOS = MAX_ROLLUP_MEMOS
 MAX_CORPUS_BYTES = 16 * 1024 * 1024
 MAX_TASK_OCCURRENCES = 4096
 MAX_RECOGNIZED_NODES = 8192

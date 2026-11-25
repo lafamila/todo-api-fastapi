@@ -27,6 +27,7 @@ try:
         check_project_membership,
     )
     from .lock_registry import ReservationConflict, get_lock_registry
+    from .task_rollup_limits import MAX_ROLLUP_MEMOS
     from .sync_auth import (
         AccountResolutionError,
         SyncAuthError,
@@ -46,6 +47,7 @@ except ImportError:  # pragma: no cover
     from connectors import get_db_connection
     from utils import can_read_memo, can_write_memo, can_write_project, check_project_membership
     from services.lock_registry import ReservationConflict, get_lock_registry
+    from services.task_rollup_limits import MAX_ROLLUP_MEMOS
     from services.sync_auth import (
         AccountResolutionError,
         SyncAuthError,
@@ -466,6 +468,10 @@ class MemoRealtimeServer:
                 )
             normalized.append({"memoId": memo_id, "leaseToken": lease_token})
         normalized.sort(key=lambda item: item["memoId"])
+        if len(normalized) > MAX_ROLLUP_MEMOS:
+            raise TaskRollupReservationError(
+                "too_many_memo_leases", "task rollup memo lease limit exceeded"
+            )
         if not normalized:
             raise TaskRollupReservationError(
                 "empty_lease_manifest", "at least one lease is required"

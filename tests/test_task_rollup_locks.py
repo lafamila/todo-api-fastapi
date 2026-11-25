@@ -110,17 +110,27 @@ class BatchReservationRegistryTests(unittest.TestCase):
             owner_key="owner-1", user_id="user-1",
         ))
 
-    def test_full_256_memo_manifest(self):
+    def test_full_1024_memo_manifest(self):
         registry = LockRegistry(ttl_seconds=60)
         leases = []
-        for index in range(256):
-            memo_id = f"memo-{index:03d}"
+        for index in range(1024):
+            memo_id = f"memo-{index:04d}"
             _, holder = registry.acquire(memo_id, "owner-1", "user-1", "User")
             leases.append({"memoId": memo_id, "leaseToken": holder["leaseToken"]})
         result = reserve(registry, list(reversed(leases)))
-        self.assertEqual(len(result["leases"]), 256)
-        self.assertEqual(result["leases"][0]["memoId"], "memo-000")
-        self.assertEqual(result["leases"][-1]["memoId"], "memo-255")
+        self.assertEqual(len(result["leases"]), 1024)
+        self.assertEqual(result["leases"][0]["memoId"], "memo-0000")
+        self.assertEqual(result["leases"][-1]["memoId"], "memo-1023")
+
+    def test_1025_memo_manifest_is_rejected_before_reservation(self):
+        registry = LockRegistry(ttl_seconds=60)
+        leases = [
+            {"memoId": f"memo-{index:04d}", "leaseToken": "token"}
+            for index in range(1025)
+        ]
+        with self.assertRaises(ReservationConflict) as raised:
+            reserve(registry, leases)
+        self.assertEqual(raised.exception.code, "too_many_memo_leases")
 
 
 class Runtime:

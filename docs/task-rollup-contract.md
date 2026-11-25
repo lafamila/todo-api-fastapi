@@ -12,7 +12,6 @@ All names below are camelCase over HTTP; database fields are snake_case. Existin
 
 ```ts
 type Alias = { seedKey: string; variantKeys: string[] }; // base/unaliased group keys
-type MemoScope = 'all' | 'recent30'; // explicit creation-date window, never silent truncation
 type Lease = { memoId: string; token: string };
 type Occurrence = {
   key: string; memoId: string; memoTitle: string; revision: string;
@@ -32,37 +31,35 @@ type Completion = {
   completedAtUtc: string; expiresAtUtc: string;
   status: 'ready' | 'pending' | 'superseded' | 'conflict' | 'undone'; canUndo: boolean;
   context?: { key: string; kind: 'task' | 'description'; text: string; checked: boolean }[];
-  memoScope?: MemoScope; // absent legacy/unshipped rows mean all
+  memoScope?: 'all' | 'recent30'; // immutable legacy receipt metadata only, not a product mode
 };
 type Preview = {
   projectId: string; corpusDigest: string;
   serverTimeUtc: string; nextBoundaryUtc: string; canComplete: boolean;
   groups: RollupNode[]; candidates: Candidate[]; aliases: Alias[];
   completions: Completion[];
-  memoScope: MemoScope; totalMemoCount: number; selectedMemoCount: number; excludedMemoCount: number;
 };
 type CompleteRequest = {
   operationId: string; corpusDigest: string; groupKey: string;
   aliases: Alias[]; occurrenceKeys: string[]; leases: Lease[];
-  memoScope?: MemoScope;
 };
-type UndoRequest = { undoOperationId: string; corpusDigest: string; leases: Lease[]; memoScope?: MemoScope };
+type UndoRequest = { undoOperationId: string; corpusDigest: string; leases: Lease[] };
 ```
 
 Every alias and physical occurrence is re-derived by the server. Task occurrences include checked copies in the selected group,
 but leases are needed only for normal memos containing markers this operation will change. No child cascade.
 Aliases are explicit request-scoped confirmation; the user may select any nonempty subset of offered variants, but each selected variant includes all physical occurrences. There is no automatic or persistent semantic equivalence.
 
-## Explicit recent-30 scope (user refinement)
+## Project-wide corpus; recent 30 is a test fixture only
 
-The user requested validating the large local `Novawork / Works` project using its latest 30 memos; older memos are a future bulk action, not authorized for marking now. `memoScope=recent30` means `created_at DESC, id DESC LIMIT 30`, not updated-time order (checkbox writes must not rotate old memos into the window). GET accepts `memoScope`; POST preview/complete/undo default omitted scope to `all`.
+The product always aggregates the selected leaf project's entire saved normal-memo corpus. There is no all/recent30 selector, request option, or source-count split. Resource overflow rejects the whole request; no silent windowing or partial completion is allowed.
 
-Default `all` behavior is preserved. The UI exposes both choices and source/selected/excluded counts; switching scope invalidates old async requests/candidate confirmations without remounting the private backlog editor. A completed operation records its memoScope; the semantic payload hash includes it. Completion includes every matching occurrence **within the explicitly selected window**, and must never mark an older excluded memo. Same-text older copies are intentionally outside this request.
+The user asked to TEST the large local `Novawork / Works` data with its latest 30 creation-date memos, not to add a product mode. Real originals are accessed only by the read-only export tool. Those exact 30 bodies may be copied into the fixed isolated QA database. Older real memos must not be read or checked as part of this validation; additional 295-cardinality sentinels are explicitly synthetic and prechecked, never copies of real old content.
 
-Recent-30 writes still fence the full eligible metadata range for the project (id/created_at, no excluded bodies), then fetch/derive only the selected 30 bodies. A newly created memo changing the window yields a stale-digest conflict. Selected-body/task/JSON bounds remain unchanged; the older metadata row count is not the 256 selected-corpus limit. No body from the excluded 295 real Works memos is required for this validation.
-Metadata scans have a separate 65,536-row ceiling and reject the entire request above it. Default `all` prechecks at 257 metadata rows before loading bodies, preserving its 256-memo bound without reading an oversized corpus.
+Full eligible metadata/body range fencing still protects completion against a newly saved duplicate or phantom insert. The internal memo/affected-source ceiling is consistently 1,024, including batch leases and durable manifests, so 325-document projects do not fail at the former 256-row boundary. The 16 MiB, task-count and JSON guards remain whole-request bounds.
 
-Today trails are filtered by their recorded view scope (`all` by default for legacy rows). A recent30 trail remains visible through its day even when a newly created memo pushes its source out of the current window. Causal assessment may load authorized receipt-referenced source bodies separately when needed; moved/inaccessible sources remain metadata-only. Explicit undo targets the recorded operation's sources, not an expanded new task group, and validates their exact after proof even if they aged out of the current window. No automatic checking of older memos is introduced.
+Older immutable receipts may retain a `memoScope` field from the removed implementation; that field is compatibility metadata only. Previously issued operation IDs/hashes must remain replayable without reinterpreting their original source manifests. Explicit undo still targets only the recorded operation's changed sources with current authorization, leases, and exact after proof. No automatic bulk check of old real Works memos is introduced.
+Deprecated `memoScope` fields on old complete/undo bodies are accepted only for recorded-receipt compatibility, with exact stored scope/hash and operation-ID checks. A fresh completion carrying that field is rejected with `422`. New requests never send it; GET and preview have no scope option.
 Description nodes are context only. Checked parent tasks remain context when unfinished children exist.
 `occurrenceKeys` must cover ALL selected-group physical occurrences (not a client-selected subset).
 Complete/undo return the durable `Completion` result; callers refetch preview after success/replay.
@@ -81,7 +78,7 @@ Complete/undo return the durable `Completion` result; callers refetch preview af
 Stable comparison keys exclude checkbox state and child ordering. Occurrence keys include memo/revision/source position.
 Use NFC/trim/ASCII-space collapse for comparison only; labels and original strings remain unchanged.
 Blank lines are transparent, ordinary non-marker text and code/table groups close ancestry.
-Corpus limits: 256 selected memos, 16 MiB logical UTF-8 source, 4096 task occurrences, 8192 recognized task/context nodes,
+Corpus limits: 1,024 project/affected memos, 16 MiB logical UTF-8 source, 4096 task occurrences, 8192 recognized task/context nodes,
 131072 source lines and 128 ancestry levels; at most 8 distinct confirmed variants per alias.
 The logical byte budget excludes only the extra `v` byte of recognized checked task markers outside code/tables.
 An absolute 16 MiB + 4096 raw-byte precheck bounds parsing. Marker-only completion/undo therefore cannot make
